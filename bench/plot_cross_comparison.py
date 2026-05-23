@@ -133,38 +133,76 @@ def _plot_problem(
     sub = [r for r in rows if r["problem"] == problem]
     opts = _present_opts(sub)
 
-    ax_curve.set_title(f"{_PROBLEM_LABELS.get(problem, problem)} — loss")
+    # Build per-optimizer mean-over-seeds trajectory; truncate to the
+    # shortest seed's length (no padding). Each line ends where its runs
+    # actually stopped — usually at converged_tol.
+    avg_by_opt: Dict[str, List[float]] = {}
+    final_by_opt: Dict[str, float] = {}
+    for opt in opts:
+        chosen = _best_lr_rows(sub, opt)
+        trajs = [_parse_trajectory(r["loss_trajectory"]) for r in chosen]
+        trajs = [t for t in trajs if t]
+        if not trajs:
+            continue
+        min_len = min(len(t) for t in trajs)
+        if min_len == 0:
+            continue
+        truncated = [t[:min_len] for t in trajs]
+        avg = [sum(c) / len(c) for c in zip(*truncated)]
+        avg_by_opt[opt] = avg
+        final_by_opt[opt] = avg[-1]
+
+    if not final_by_opt:
+        return
+
+    # Divergence filter: drop optimizers whose final loss is > 3× the
+    # median of all candidates (symmetric across optimizers; an optimizer
+    # that diverged on a problem is removed honestly).
+    vals = sorted(final_by_opt.values())
+    med = vals[len(vals) // 2]
+    thresh = max(3.0 * med, med + 1.0)
+    diverged = {o: v for o, v in final_by_opt.items() if v > thresh}
+    converged_avg = {o: a for o, a in avg_by_opt.items() if o not in diverged}
+    converged_final = {o: v for o, v in final_by_opt.items() if o not in diverged}
+
+    diverged_note = ""
+    if diverged:
+        bits = [f"{o} ({v:.2g})" for o, v in sorted(diverged.items(), key=lambda kv: -kv[1])]
+        diverged_note = f"  [diverged: {', '.join(bits)}]"
+
+    ax_curve.set_title(
+        f"{_PROBLEM_LABELS.get(problem, problem)} — loss{diverged_note}",
+        fontsize=10,
+    )
     ax_curve.set_xlabel("step")
     ax_curve.set_ylabel("loss")
     ax_curve.set_yscale("log")
-    ax_curve.grid(True, alpha=0.3, which="both")
+    ax_curve.grid(True, alpha=0.25, linewidth=0.5, which="both")
 
-    bar_finals: Dict[str, float] = {}
-    for opt in opts:
-        chosen = _best_lr_rows(sub, opt)
-        trajectories = [_parse_trajectory(r["loss_trajectory"]) for r in chosen]
-        trajectories = [t for t in trajectories if t]
-        if not trajectories:
-            continue
-        mean, lo, hi = _mean_band(trajectories)
-        x = np.arange(1, len(mean) + 1)
+    # Raw curves, thin/alpha so overlap remains legible.
+    for opt, avg in converged_avg.items():
         color = _OPT_COLOR.get(opt, "#000")
-        ax_curve.plot(x, mean, color=color, label=opt, linewidth=1.5)
-        ax_curve.fill_between(x, lo, hi, color=color, alpha=0.15)
-        # Final-loss bar uses mean of the final point across seeds.
-        bar_finals[opt] = float(mean[-1])
+        x = np.arange(1, len(avg) + 1)
+        ax_curve.plot(x, avg, color=color, label=opt, linewidth=0.7, alpha=0.85)
     ax_curve.legend(loc="upper right", fontsize=8)
 
-    if bar_finals:
-        order = [o for o in opts if o in bar_finals]
-        vals = [bar_finals[o] for o in order]
-        ax_bar.bar(
-            order, vals, color=[_OPT_COLOR.get(o, "#000") for o in order]
-        )
-        ax_bar.set_title(f"{_PROBLEM_LABELS.get(problem, problem)} — final loss")
-        ax_bar.set_ylabel("final loss")
-        ax_bar.grid(True, axis="y", alpha=0.3)
-        ax_bar.tick_params(axis="x", rotation=30, labelsize=8)
+    if converged_final:
+        ordered = sorted(converged_final.items(), key=lambda kv: kv[1])
+        names = [o for o, _ in ordered]
+        finals = [v for _, v in ordered]
+        colors = [_OPT_COLOR.get(o, "#000") for o in names]
+        ypos = list(range(len(names)))
+        ax_bar.barh(ypos, finals, color=colors, height=0.7)
+        ax_bar.set_yticks(ypos)
+        ax_bar.set_yticklabels(names, fontsize=9)
+        ax_bar.invert_yaxis()
+        ax_bar.set_title(f"final loss (lower = better)", fontsize=10)
+        ax_bar.set_xlabel("final loss")
+        ax_bar.grid(True, axis="x", alpha=0.25, linewidth=0.5)
+        for i, v in enumerate(finals):
+            ax_bar.text(v, i, f" {v:.3g}",
+                        va="center", ha="left", fontsize=8, color="#222")
+        ax_bar.set_xlim(min(finals) * 0.9, max(finals) * 1.15)
 
 
 def render(input_csv: Path, output_png: Path) -> None:

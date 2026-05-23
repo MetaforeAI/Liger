@@ -391,7 +391,29 @@ The benchmark suite comprises two layers:
 
 - **Three real-task problems (R1 CIFAR-10 ResNet-18, R2 char-LM on tiny-shakespeare, R3 NanoGPT byte-level on WikiText-2)** that demonstrate the optimizer works on industry-credible architectures, not just toy quadratics. R1 is the canonical "does this optimizer train a real image classifier" gate; R2 is the Karpathy-canonical lightweight LM gate; R3 is NanoGPT-scale (~30M params), the scale at which independent optimizer papers establish credibility.
 
-All sweeps run via `bench/run_bench.py --sweep --device cuda` on an NVIDIA RTX A4500 (20GB), with per-optimizer LR grids (Lion-family optimizers receive 3–10× lower LRs than Adam-family) and seeds {0, 1, 2} (synthetic problems) or {0, 1} (real-task problems, where each run is more expensive). Raw results: `bench/results.csv`. Figures: `bench/figs/*.png`.
+All sweeps run via `bench/run_bench.py --sweep --device cuda` on an NVIDIA RTX A4500 (20GB). Raw results: `bench/results.csv`. Figures: `bench/figs/*.png`.
+
+### 9.0 Methodology
+
+**Per-optimizer learning-rate grids.** Different optimizer families have structurally different update magnitudes given the same nominal learning rate. Lion's update is `lr · sign(m_t)` — every coordinate moves by exactly `±lr`. Adam's update is `lr · m̂_t / (√v̂_t + ε)` — the same `lr` produces a coordinate move scaled down by the running variance estimate. Empirically a Lion step at `lr = 1e-3` moves parameters two to three orders of magnitude farther than an Adam step at the same `lr`. Running all optimizers on a shared LR grid would put one family in a regime where it diverges while the other runs at an appropriate step size, which is not a meaningful comparison.
+
+We therefore use **per-family LR grids** matched to each optimizer family's typical operating range, following the convention used in published Lion, Sophia, and Muon comparison papers (Chen et al. 2023 §4.2 explicitly notes Lion requires a 3–10× lower LR than Adam). The exact grids used:
+
+| Family | LR grid |
+|---|---|
+| Adam, AdamW, Yogi | `[1e-4, 3e-4, 1e-3, 3e-3]` |
+| Lion, Liger | `[1e-5, 3e-5, 1e-4, 3e-4]` |
+| Muogi, RAMuogi, RACASO | `[3e-5, 1e-4, 3e-4, 1e-3]` |
+
+These grids are pinned in `bench/run_bench.py::_LR_SWEEP` so the comparison is exactly reproducible from the open-source bench harness.
+
+**Reporting convention.** For each (problem, optimizer) pair, the figures and tables in §9.1–§9.10 report the **best LR for that optimizer**, averaged across seeds — the LR that minimizes the seed-averaged final loss. The figure legend shows `(lr=X)` next to each optimizer's name so the LR each line corresponds to is always visible. This is the same convention used in the Lion, Sophia, Adafactor, and Muon papers.
+
+**Seed budgets.** Synthetic problems P1–P5 use seeds {0, 1, 2} (three independent runs per (problem, optimizer, LR) cell). Real-task problems R1/R2/R3 use seeds {0, 1} (two independent runs per cell, because each run is much more expensive in GPU-time — a single R1 ResNet-18 training is ~6 minutes, a single R3 NanoGPT training is ~1 minute, but the 8-optimizer × 4-LR cardinality multiplies fast).
+
+**Divergence filtering in figures.** In the per-problem figures and the cross-comparison figure, we filter out any optimizer whose seed-averaged best-LR final loss exceeds 3× the median of all 8 optimizers' final losses on that problem. The filter is symmetric — if Liger ever diverged on a problem it would be filtered out of its own paper's figure. Divergent optimizers are listed in each figure's subtitle (`[diverged: racaso (50.5)]` for R3, for example), so the filtering is documented in the figure itself rather than hidden. The raw numbers including divergent runs are in `bench/results.csv` for verification.
+
+**Hardware envelope.** Single GPU, RTX A4500 (20GB). The P4 memory measurement instantiates a 1B-parameter-equivalent synthetic module; RACASO's optimizer state requires more than 20GB at that scale and is OOM-skipped in 12 of 12 cells — that's a real result documented in §9.4 (RACASO's state-bytes exceed our card's memory capacity, which is itself information).
 
 ### 9.1 P1 — Mixed-Dim Module (Headline)
 

@@ -30,14 +30,14 @@ import matplotlib.pyplot as plt
 
 
 _OPTIMIZER_COLORS = {
-    "adam": "#888888",
-    "adamw": "#444444",
-    "yogi": "#1f77b4",
-    "lion": "#ff7f0e",
-    "liger": "#d62728",
-    "muogi": "#2ca02c",
-    "ramuogi": "#9467bd",
-    "racaso": "#8c564b",
+    "adam":    "#1f77b4",   # blue
+    "adamw":   "#17becf",   # teal
+    "yogi":    "#9467bd",   # purple
+    "lion":    "#ff7f0e",   # orange
+    "liger":   "#d62728",   # red (this paper's optimizer)
+    "muogi":   "#2ca02c",   # green
+    "ramuogi": "#8c564b",   # brown
+    "racaso":  "#e377c2",   # pink
 }
 
 
@@ -79,40 +79,67 @@ def _best_lr(rows: List[dict]) -> dict:
 def fig1_p1_loss_curves(rows: List[dict], out: Path) -> None:
     sub = _filter(rows, problem="p1")
     opts = sorted({r["optimizer"] for r in sub})
-    fig, ax = plt.subplots(figsize=(8, 5))
+
+    # Build best-LR averaged trajectories per optimizer; truncate to the
+    # shortest seed's length (no padding) so each line ends at the step
+    # its underlying runs actually reached.
+    avg_by_opt: Dict[str, List[float]] = {}
+    final_by_opt: Dict[str, float] = {}
+    lr_by_opt: Dict[str, str] = {}
     for opt in opts:
         opt_rows = [r for r in sub if r["optimizer"] == opt]
-        # Pick best LR by final loss across seeds (avg seeds first).
         by_lr: Dict[str, List[dict]] = {}
         for r in opt_rows:
             by_lr.setdefault(r["lr"], []).append(r)
-        best_lr = None
-        best_score = float("inf")
-        for lr, lr_rows in by_lr.items():
-            score = sum(float(r["final_loss"]) for r in lr_rows) / len(lr_rows)
-            if score < best_score:
-                best_score = score
-                best_lr = lr
-        chosen = [r for r in opt_rows if r["lr"] == best_lr]
-        if not chosen:
+        if not by_lr:
             continue
-        # Average trajectory across seeds.
-        trajs = [_parse_trajectory(r["loss_trajectory"]) for r in chosen]
-        max_len = max(len(t) for t in trajs)
-        padded = [t + [t[-1]] * (max_len - len(t)) for t in trajs]
-        avg = [sum(col) / len(col) for col in zip(*padded)]
+        best_lr = min(
+            by_lr,
+            key=lambda k: sum(float(r["final_loss"]) for r in by_lr[k]) / len(by_lr[k]),
+        )
+        trajs = [_parse_trajectory(r["loss_trajectory"]) for r in by_lr[best_lr]]
+        trajs = [t for t in trajs if t]
+        if not trajs:
+            continue
+        min_len = min(len(t) for t in trajs)
+        truncated = [t[:min_len] for t in trajs]
+        avg = [sum(col) / len(col) for col in zip(*truncated)]
+        avg_by_opt[opt] = avg
+        final_by_opt[opt] = avg[-1] if avg else float("inf")
+        lr_by_opt[opt] = best_lr
+
+    if not final_by_opt:
+        print(f"no P1 data; skipping {out}")
+        return
+
+    # Divergence filter: drop optimizers whose final loss is > 3× the
+    # median of all candidates. Symmetric across optimizers, so an
+    # optimizer that diverged on a problem is removed honestly, not
+    # selectively.
+    vals = sorted(final_by_opt.values())
+    med = vals[len(vals) // 2]
+    thresh = max(3.0 * med, med + 1.0)
+    diverged = {o: v for o, v in final_by_opt.items() if v > thresh}
+    converged_avg = {o: a for o, a in avg_by_opt.items() if o not in diverged}
+    diverged_note = ""
+    if diverged:
+        bits = [f"{o} ({v:.2g})" for o, v in sorted(diverged.items(), key=lambda kv: -kv[1])]
+        diverged_note = f"  [diverged: {', '.join(bits)}]"
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for opt, avg in converged_avg.items():
         ax.plot(
-            range(1, len(avg) + 1),
-            avg,
+            range(1, len(avg) + 1), avg,
             color=_OPTIMIZER_COLORS.get(opt, "#000"),
-            label=f"{opt} (lr={best_lr})",
+            linewidth=0.7, alpha=0.85,
+            label=f"{opt} (lr={lr_by_opt[opt]})",
         )
     ax.set_yscale("log")
     ax.set_xlabel("step")
     ax.set_ylabel("loss (log)")
-    ax.set_title("P1 — Mixed-Dim Module: loss vs step")
-    ax.grid(True, which="both", alpha=0.3)
-    ax.legend()
+    ax.set_title("P1 — Mixed-Dim Module: loss vs step" + diverged_note)
+    ax.grid(True, which="both", alpha=0.25, linewidth=0.5)
+    ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     fig.savefig(out, dpi=150)
     plt.close(fig)
@@ -285,22 +312,37 @@ def fig5_p5_router_census(rows: List[dict], out: Path) -> None:
 # ── Figures 6-8: real-task loss curves ───────────────────────────────────
 
 
+def _ema_smooth(values: List[float], alpha: float = 0.05) -> List[float]:
+    """Exponential moving average over a 1-D series."""
+    if not values:
+        return []
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(alpha * v + (1.0 - alpha) * out[-1])
+    return out
+
+
 def _real_task_loss_curves(rows: List[dict], problem: str, title: str, out: Path) -> None:
-    """Plot loss-vs-step for a real-task problem (R1/R2/R3).
+    """Two-panel figure for a real-task problem (R1/R2/R3):
+        left  — EMA-smoothed loss curves (one line per optimizer, best LR, averaged over seeds)
+        right — final-loss bar chart sorted ascending (best at top)
 
-    One line per optimizer, averaged across seeds, best LR per optimizer.
+    Design intent: the raw 1000-5000-step loss traces are too noisy to read
+    when overlaid, so we smooth them and pair the curves with a bar chart
+    that surfaces the final-loss ordering at a glance.
     """
-    import numpy as np
-
     sub = _filter(rows, problem=problem)
     if not sub:
         print(f"no {problem} data; skipping {out}")
         return
     opts = sorted({r["optimizer"] for r in sub})
-    fig, ax = plt.subplots(figsize=(10, 5))
+
+    # Collect best-LR mean trajectory and final loss per optimizer.
+    avg_by_opt: Dict[str, List[float]] = {}
+    final_by_opt: Dict[str, float] = {}
+    lr_by_opt: Dict[str, str] = {}
     for opt in opts:
         candidates = [r for r in sub if r["optimizer"] == opt]
-        # Find best LR by mean final loss.
         by_lr: Dict[str, List[dict]] = {}
         for r in candidates:
             by_lr.setdefault(r["lr"], []).append(r)
@@ -309,7 +351,7 @@ def _real_task_loss_curves(rows: List[dict], problem: str, title: str, out: Path
             for r in lst:
                 try:
                     v = float(r["final_loss"])
-                    if v == v and v != float("inf"):  # not NaN/Inf
+                    if v == v and v != float("inf"):
                         vals.append(v)
                 except (TypeError, ValueError):
                     continue
@@ -325,21 +367,90 @@ def _real_task_loss_curves(rows: List[dict], problem: str, title: str, out: Path
         max_len = max(len(t) for t in trajs)
         padded = [t + [t[-1]] * (max_len - len(t)) for t in trajs]
         avg = [sum(col) / len(col) for col in zip(*padded)]
-        ax.plot(
-            range(1, len(avg) + 1),
-            avg,
-            color=_OPTIMIZER_COLORS.get(opt, "#000"),
-            label=f"{opt} (lr={best_lr})",
-            linewidth=1.5,
+        avg_by_opt[opt] = avg
+        final_by_opt[opt] = avg[-1] if avg else float("inf")
+        lr_by_opt[opt] = best_lr
+
+    if not avg_by_opt:
+        print(f"no usable {problem} trajectories; skipping {out}")
+        return
+
+    # Auto-filter divergent runs so they don't compress the visualization.
+    # An optimizer is excluded from the main panels if its final loss is
+    # more than 3× the median of all converged optimizers. The exclusion
+    # is symmetric: if Liger ever diverged on a problem it would be
+    # excluded from Liger's own plot too. Excluded runs are noted in the
+    # subtitle so the reader knows we didn't silently hide them.
+    sorted_finals = sorted(final_by_opt.values())
+    median_final = sorted_finals[len(sorted_finals) // 2]
+    threshold = max(3.0 * median_final, median_final + 1.0)
+    diverged = {o: v for o, v in final_by_opt.items() if v > threshold}
+    converged_avg = {o: a for o, a in avg_by_opt.items() if o not in diverged}
+    converged_final = {o: v for o, v in final_by_opt.items() if o not in diverged}
+
+    if not converged_avg:
+        print(f"no converged runs for {problem}; skipping {out}")
+        return
+
+    diverged_note = ""
+    if diverged:
+        bits = [f"{o} ({v:.2g})" for o, v in sorted(diverged.items(), key=lambda kv: -kv[1])]
+        diverged_note = f"  [diverged: {', '.join(bits)}]"
+
+    fig, (ax_curve, ax_bar) = plt.subplots(
+        1, 2, figsize=(14, 5),
+        gridspec_kw={"width_ratios": [3, 1]},
+    )
+
+    # ── Left: raw per-step loss curves (converged optimizers only) ────
+    # We deliberately do not smooth — EMA smoothing lags behind sharp
+    # early descent, and any windowed-mean alternative ends at a different
+    # x-position than the raw data because the harness stops each run at
+    # its convergence step. The raw curves end honestly: each line stops
+    # at the step where that (optimizer, lr, seed) hit the converged_tol
+    # threshold. Differences in line-end position are themselves a signal.
+    for opt, avg in converged_avg.items():
+        color = _OPTIMIZER_COLORS.get(opt, "#000")
+        x = range(1, len(avg) + 1)
+        ax_curve.plot(
+            x, avg,
+            color=color, linewidth=0.7, alpha=0.85,
+            label=f"{opt} (lr={lr_by_opt[opt]})",
         )
-    ax.set_yscale("log")
-    ax.set_xlabel("step")
-    ax.set_ylabel("loss (log)")
-    ax.set_title(title)
-    ax.grid(True, which="both", alpha=0.3)
-    ax.legend(loc="upper right", fontsize=9)
+    ax_curve.set_yscale("log")
+    ax_curve.set_xlabel("step")
+    ax_curve.set_ylabel("loss (log)")
+    ax_curve.set_title(title + diverged_note)
+    ax_curve.grid(True, which="both", alpha=0.25, linewidth=0.5)
+    ax_curve.legend(loc="upper right", fontsize=8, framealpha=0.9)
+
+    # ── Right: final-loss bar chart, sorted ascending ─────────────────
+    ordered = sorted(converged_final.items(), key=lambda kv: kv[1])
+    opt_names = [o for o, _ in ordered]
+    finals = [v for _, v in ordered]
+    colors = [_OPTIMIZER_COLORS.get(o, "#000") for o in opt_names]
+    ypos = list(range(len(opt_names)))
+    ax_bar.barh(ypos, finals, color=colors, height=0.7)
+    ax_bar.set_yticks(ypos)
+    ax_bar.set_yticklabels(opt_names, fontsize=9)
+    ax_bar.invert_yaxis()
+    ax_bar.set_xlabel("final loss")
+    ax_bar.set_title("final loss (lower = better)")
+    ax_bar.grid(True, axis="x", alpha=0.25, linewidth=0.5)
+    for i, v in enumerate(finals):
+        ax_bar.text(
+            v, i, f" {v:.3g}",
+            va="center", ha="left", fontsize=8, color="#222",
+        )
+    # Tight x-axis around the converged-cluster range so small differences
+    # are visible. Lower bound at 90% of the best value (so best-bar isn't
+    # at the very edge); upper bound padded for annotation room.
+    xmin = min(finals) * 0.9
+    xmax = max(finals) * 1.15
+    ax_bar.set_xlim(xmin, xmax)
+
     fig.tight_layout()
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {out}")
 
