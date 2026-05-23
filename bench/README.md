@@ -7,10 +7,43 @@ Five-problem benchmark suite designed to isolate Liger's analytical claims again
 | Phase | Status | Contents |
 |---|---|---|
 | **Phase 1: Scaffold** | ✅ done | `BenchProblem` ABC (`problems/base.py`), vendored Yogi (`optimizers/yogi.py`). |
-| **Phase 2: Optimizers** | 🚧 pending | `optimizers/wrappers.py` dispatch, vendored `lion-pytorch`, family-import wrappers for Muogi/RAMuogi/RACASO. |
-| **Phase 3: Problems** | 🚧 pending | `problems/p1`...`p5` implementations. |
-| **Phase 4: Harness** | 🚧 pending | `run_bench.py` CSV emitter, `plot_bench.py` figure renderer. |
-| **Phase 5: RunPod sweep** | 🚧 pending | Full 480-run sweep on H100, paper figure generation. |
+| **Phase 2: Optimizers** | ✅ done | `optimizers/wrappers.py` dispatch, vendored Lion (`optimizers/lion.py`), family imports for Muogi/RAMuogi/RACASO. |
+| **Phase 3: Problems** | ✅ done | `problems/p1`...`p5` implementations. |
+| **Phase 4: Harness** | ✅ done | `run_bench.py` CSV emitter, `plot_bench.py` figure renderer. |
+| **Phase 5: GPU sweep** | ✅ done (RunPod RTX A4500, 2026-05-22) | 240-run matrix (5 problems × 4 optimizers × 4 LRs × 3 seeds). Results in `results.csv`, log in `sweep.log`, figures in `figs/`. |
+
+## Verification artifacts
+
+All bench data is committed in this directory for reproducibility:
+
+| File | Size | What |
+|---|---|---|
+| `results.csv` | ~1.2 MB | 240 rows, one per (problem, optimizer, lr, seed). Schema in §"CSV schema" below. |
+| `sweep.log` | ~10 KB | Per-run stdout from `run_bench.py --sweep`. |
+| `figs/fig1_p1_loss_curves.png` | ~88 KB | P1 mixed-dim, loss-vs-step across optimizers (log-y). |
+| `figs/fig2_p2_v_hat_trajectories.png` | ~32 KB | P2 scalar burst, final `v_hat` per optimizer (log-log scatter). |
+| `figs/fig3_p3_early_loss.png` | ~33 KB | P3 warmup-free, loss at step 1/5/50 bar chart. |
+| `figs/fig4_p4_state_bytes.png` | ~33 KB | P4 memory, optimizer-state bytes bar chart. |
+| `figs/fig5_p5_router_census.png` | ~47 KB | P5 router, telemetry vs ground-truth scatter. |
+| `morpheus_v2.2_liger_telemetry.csv` | ~2 KB | Live in-production telemetry parsed from a Neo v2.2 training log (see Liger_Paper.md §9.6). |
+| `morpheus_v2.2_liger_trajectory.png` | ~50 KB | Plot of the live telemetry above. |
+
+To re-run from scratch and regenerate these files:
+
+```bash
+python bench/run_bench.py --sweep --output bench/results.csv 2>&1 | tee bench/sweep.log
+python bench/plot_bench.py --input bench/results.csv --output bench/figs/
+```
+
+Numerical headline results from the 2026-05-22 run:
+
+| Problem | Headline number |
+|---|---|
+| P1 mixed-dim | All 4 optimizers (adamw, lion, yogi, liger) converge to ~9.9e-3 at best LR. Liger is competitive but not statistically separable on this problem size. |
+| P3 warmup-free | AdamW reaches lower step-50 loss (5.7e-2) than Liger/Lion (~1.7e-1) on this tanh-MLP regression. AdamW with β2=0.999 is already operational at step 1 here. |
+| **P4 memory** | **Liger: 4,029,153,920 bytes (50.02% of AdamW's 8,055,689,280)**. Lion: 50.00%. Yogi: 100.00%. |
+| **P5 router** | Liger telemetry: 6 Lion-route, 5 Yogi-route — **exact match** to hand-counted ndim ground truth. |
+| P2 scalar burst | Liger's `v_hat` shows the expected `~1e5` post-burst residual; non-Liger optimizers do not expose `v_hat` through the harness's telemetry interface. |
 
 ## Claim ledger
 

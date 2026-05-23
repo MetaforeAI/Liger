@@ -43,12 +43,16 @@ class BenchProblem(ABC):
     max_steps: int = 0
     converged_tol: float = 0.0
 
-    def __init__(self, seed: int) -> None:
+    def __init__(self, seed: int, device: str = "cpu") -> None:
         if not isinstance(seed, int):
             raise TypeError(f"seed must be int, got {type(seed).__name__}")
         self.seed = seed
+        self.device = torch.device(device)
         # Subclasses are expected to use ``self._generator`` for any
-        # randomness so reproducibility holds.
+        # randomness so reproducibility holds. We keep the generator on
+        # CPU and rely on subclasses to move tensors to ``self.device``
+        # after sampling — torch.Generator with CUDA support adds
+        # complications that aren't worth it for benchmark scale.
         self._generator = torch.Generator()
         self._generator.manual_seed(seed)
 

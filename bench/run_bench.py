@@ -46,6 +46,9 @@ from bench.problems.p4_memory_scaling import (
     measure_optimizer_state_bytes,
 )
 from bench.problems.p5_router_correctness import P5RouterCorrectness
+from bench.problems.r1_cifar10_resnet18 import R1Cifar10ResNet18
+from bench.problems.r2_charlm_shakespeare import R2CharLMShakespeare
+from bench.problems.r3_nanogpt_wikitext2 import R3NanoGPTWikitext2
 
 
 _PROBLEMS = {
@@ -54,6 +57,9 @@ _PROBLEMS = {
     "p3": P3WarmupFree,
     "p4": P4MemoryScaling,
     "p5": P5RouterCorrectness,
+    "r1_cifar10_resnet18": R1Cifar10ResNet18,
+    "r2_charlm_shakespeare": R2CharLMShakespeare,
+    "r3_nanogpt_wikitext2": R3NanoGPTWikitext2,
 }
 
 _CSV_COLUMNS = [
@@ -76,12 +82,12 @@ _CSV_COLUMNS = [
 ]
 
 
-def _build_problem(name: str, seed: int) -> BenchProblem:
+def _build_problem(name: str, seed: int, device: str = "cpu") -> BenchProblem:
     if name not in _PROBLEMS:
         raise ValueError(
             f"unknown problem '{name}'; known: {sorted(_PROBLEMS)}"
         )
-    return _PROBLEMS[name](seed)
+    return _PROBLEMS[name](seed, device=device)
 
 
 def _liger_telemetry(opt: torch.optim.Optimizer) -> dict:
@@ -111,13 +117,16 @@ def run_one(
     lr: float,
     seed: int,
     max_steps: Optional[int] = None,
+    device: str = "cpu",
 ) -> dict:
     """Run one (problem, optimizer, lr, seed) configuration.
 
     Returns a dict matching the CSV row schema.
     """
     torch.manual_seed(seed)
-    problem = _build_problem(problem_name, seed)
+    if device == "cuda":
+        torch.cuda.manual_seed_all(seed)
+    problem = _build_problem(problem_name, seed, device=device)
     params = problem.init_params()
     opt = build_optimizer(optimizer_name, params, lr)
 
@@ -126,6 +135,9 @@ def run_one(
     trajectory: List[float] = []
     nan_count = 0
     convergence_step = -1
+    use_cuda = (device == "cuda")
+    if use_cuda:
+        torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     for step in range(1, cap + 1):
@@ -155,6 +167,8 @@ def run_one(
             if problem.converged(loss, step):
                 break
 
+    if use_cuda:
+        torch.cuda.synchronize()
     t1 = time.perf_counter()
     elapsed_us = (t1 - t0) * 1e6
     steps_run = len(trajectory)
@@ -214,40 +228,73 @@ _LR_SWEEP = {
     "racaso":  [3e-5, 1e-4, 3e-4, 1e-3],
 }
 
-_DEFAULT_SWEEP_OPTIMIZERS = ("adamw", "yogi", "lion", "liger")
+_DEFAULT_SWEEP_OPTIMIZERS = (
+    "adam", "adamw", "yogi", "lion", "liger", "muogi", "ramuogi", "racaso",
+)
 _DEFAULT_SWEEP_SEEDS = (0, 1, 2)
+_DEFAULT_SWEEP_PROBLEMS = (
+    "p1", "p2", "p3", "p4", "p5",
+    "r1_cifar10_resnet18",
+    "r2_charlm_shakespeare",
+    "r3_nanogpt_wikitext2",
+)
+# Real-task problems get a reduced LR/seed cardinality because each run
+# is much more expensive (CIFAR-10 ResNet, char-LM, NanoGPT). The
+# reduction is per-problem so the synthetic problems still get the full
+# matrix.
+_REAL_TASK_PROBLEMS = ("r1_cifar10_resnet18", "r2_charlm_shakespeare", "r3_nanogpt_wikitext2")
+_REAL_TASK_LR_OVERRIDE = {
+    "adam":    [1e-3],
+    "adamw":   [1e-3],
+    "yogi":    [1e-3],
+    "lion":    [3e-4],
+    "liger":   [3e-4],
+    "muogi":   [3e-4],
+    "ramuogi": [3e-4],
+    "racaso":  [3e-4],
+}
+_REAL_TASK_SEEDS = (0, 1)
 
 
 def run_sweep(
     out_path: Path,
-    problems: Tuple[str, ...] = ("p1", "p2", "p3", "p4", "p5"),
+    problems: Tuple[str, ...] = _DEFAULT_SWEEP_PROBLEMS,
     optimizers: Tuple[str, ...] = _DEFAULT_SWEEP_OPTIMIZERS,
     seeds: Tuple[int, ...] = _DEFAULT_SWEEP_SEEDS,
+    device: str = "cpu",
     skip_existing: bool = False,
 ) -> None:
     """Run the full sweep matrix and write rows to CSV.
 
-    Skips (problem, optimizer) pairs that don't make sense (e.g., P5
-    against non-Liger optimizers reports a degenerate router-check; the
-    harness still runs it for completeness but the analysis side
-    filters).
+    For real-task problems (R1/R2/R3), the harness uses a reduced
+    cardinality (one LR per optimizer family, 2 seeds) because each run
+    is too expensive for a full 4-LR × 3-seed grid.
     """
-    total = sum(
-        len(_LR_SWEEP[opt]) * len(seeds) for opt in optimizers
-    ) * len(problems)
-    print(f"sweep: {total} runs total → {out_path}")
+    def lr_grid(problem: str, opt: str) -> List[float]:
+        if problem in _REAL_TASK_PROBLEMS:
+            return _REAL_TASK_LR_OVERRIDE.get(opt, [3e-4])
+        return _LR_SWEEP[opt]
+
+    def seed_grid(problem: str) -> Tuple[int, ...]:
+        return _REAL_TASK_SEEDS if problem in _REAL_TASK_PROBLEMS else seeds
+
+    total = 0
+    for problem in problems:
+        for opt in optimizers:
+            total += len(lr_grid(problem, opt)) * len(seed_grid(problem))
+    print(f"sweep: {total} runs total → {out_path} [device={device}]")
     n = 0
     for problem in problems:
         for opt in optimizers:
-            for lr in _LR_SWEEP[opt]:
-                for seed in seeds:
+            for lr in lr_grid(problem, opt):
+                for seed in seed_grid(problem):
                     n += 1
                     print(
                         f"[{n}/{total}] {problem} × {opt} × lr={lr} × seed={seed}",
                         flush=True,
                     )
                     try:
-                        row = run_one(problem, opt, lr, seed)
+                        row = run_one(problem, opt, lr, seed, device=device)
                     except NotImplementedError as exc:
                         print(f"  SKIP: {exc}")
                         continue
@@ -269,18 +316,34 @@ def main() -> None:
     ap.add_argument("--max-steps", type=int, help="override problem.max_steps")
     ap.add_argument("--output", type=Path, help="CSV output path")
     ap.add_argument("--sweep", action="store_true", help="run the full sweep matrix")
+    ap.add_argument(
+        "--device",
+        choices=("cpu", "cuda"),
+        default="cpu",
+        help="device for tensors (default: cpu)",
+    )
     args = ap.parse_args()
+
+    if args.device == "cuda" and not torch.cuda.is_available():
+        ap.error("--device cuda requested but torch.cuda.is_available() is False")
 
     if args.sweep:
         if args.output is None:
             args.output = Path("results.csv")
-        run_sweep(args.output)
+        run_sweep(args.output, device=args.device)
         return
 
     if not (args.problem and args.optimizer and args.lr):
         ap.error("--problem, --optimizer, and --lr are required (unless --sweep)")
 
-    row = run_one(args.problem, args.optimizer, args.lr, args.seed, args.max_steps)
+    row = run_one(
+        args.problem,
+        args.optimizer,
+        args.lr,
+        args.seed,
+        args.max_steps,
+        device=args.device,
+    )
     _write_row(args.output, row, append=False)
 
 

@@ -45,21 +45,22 @@ class P4MemoryScaling(BenchProblem):
 
     def init_params(self) -> List[torch.Tensor]:
         params: List[torch.Tensor] = []
+        d = self.device
         for _ in range(_NUM_BLOCKS):
             # 4 attention projections: Q, K, V, O — each d × d.
             for _ in range(4):
-                params.append(torch.zeros(_HIDDEN, _HIDDEN, requires_grad=True))
+                params.append(torch.zeros(_HIDDEN, _HIDDEN, device=d, requires_grad=True))
             # 2 MLP matrices: d × 4d and 4d × d.
-            params.append(torch.zeros(_HIDDEN, 4 * _HIDDEN, requires_grad=True))
-            params.append(torch.zeros(4 * _HIDDEN, _HIDDEN, requires_grad=True))
+            params.append(torch.zeros(_HIDDEN, 4 * _HIDDEN, device=d, requires_grad=True))
+            params.append(torch.zeros(4 * _HIDDEN, _HIDDEN, device=d, requires_grad=True))
             # 2 RMSNorm gains.
             for _ in range(2):
-                params.append(torch.ones(_HIDDEN, requires_grad=True))
+                params.append(torch.ones(_HIDDEN, device=d, requires_grad=True))
             # 1 attention output scale.
-            params.append(torch.tensor(1.0, requires_grad=True))
+            params.append(torch.tensor(1.0, device=d, requires_grad=True))
             # 2 attention biases.
             for _ in range(2):
-                params.append(torch.zeros(_HIDDEN, requires_grad=True))
+                params.append(torch.zeros(_HIDDEN, device=d, requires_grad=True))
         return params
 
     def loss_and_grad(

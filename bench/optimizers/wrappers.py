@@ -4,29 +4,33 @@
 ``torch.optim.Optimizer``. All hyperparameters other than ``lr`` are
 pinned here so the sweep matrix only varies optimizer × LR × seed.
 
+Every optimizer is vendored as a standalone source file in this
+``bench/optimizers/`` directory — no sibling-repo imports, no sys.path
+gymnastics. This includes the optimizers from our own sibling research
+projects (Muogi, RAMuogi, RACASO): we treat them exactly like we treat
+Lion and Yogi — copy the source file, document the upstream commit at
+the top of the copy, build via a normal Python import.
+
 Canonical configs (single source of truth):
 
     adam     : torch.optim.Adam(lr, betas=(0.9, 0.999), eps=1e-8)
     adamw    : torch.optim.AdamW(lr, betas=(0.9, 0.999), eps=1e-8, wd=0.01)
     yogi     : Yogi(lr, betas=(0.9, 0.999), eps=1e-3, init_acc=1e-6, wd=0.0)
-               — vendored at bench/optimizers/yogi.py
+               — bench/optimizers/yogi.py (Zaheer et al. 2018)
     lion     : Lion(lr, betas=(0.9, 0.99), wd=0.0)
-               — vendored at bench/optimizers/lion.py (Chen et al. 2023)
+               — bench/optimizers/lion.py (Chen et al. 2023)
     liger    : Liger(lr, betas=(0.9, 0.99), eps_yogi=1e-3, wd=0.0)
-               — the optimizer under study; imported from parent liger.py
+               — bench/optimizers/liger.py (vendored from sibling repo)
     muogi    : Muogi(lr, default Muogi config)
-               — imported from sibling Muogi/muogi.py (NotImplementedError
-                 with pointer if not on sys.path)
+               — bench/optimizers/muogi.py
     ramuogi  : RAMuogi(lr, default RAMuogi config)
-               — imported from sibling Muogi/ramuogi.py
+               — bench/optimizers/ramuogi.py
     racaso   : RACASO(lr, default RACASO config)
-               — imported from sibling RACASO/racaso.py
+               — bench/optimizers/racaso.py
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import List
 
 import torch
@@ -42,24 +46,6 @@ KNOWN_OPTIMIZERS = (
     "ramuogi",
     "racaso",
 )
-
-
-def _sibling_path(name: str) -> Path:
-    """Return the absolute path to a sibling research project directory."""
-    here = Path(__file__).resolve()
-    return here.parents[3] / name
-
-
-def _add_to_syspath(path: Path) -> None:
-    sp = str(path)
-    if sp not in sys.path:
-        sys.path.insert(0, sp)
-
-
-def _add_parent_liger_to_syspath() -> None:
-    """The Liger optimizer lives one directory above bench/."""
-    liger_root = Path(__file__).resolve().parents[2]
-    _add_to_syspath(liger_root)
 
 
 # ── Constructors ─────────────────────────────────────────────────────────
@@ -95,8 +81,7 @@ def _build_lion(params: List[torch.Tensor], lr: float) -> torch.optim.Optimizer:
 
 
 def _build_liger(params: List[torch.Tensor], lr: float) -> torch.optim.Optimizer:
-    _add_parent_liger_to_syspath()
-    from liger import Liger  # type: ignore[import-not-found]
+    from bench.optimizers.liger import Liger
 
     return Liger(
         params,
@@ -108,38 +93,20 @@ def _build_liger(params: List[torch.Tensor], lr: float) -> torch.optim.Optimizer
 
 
 def _build_muogi(params: List[torch.Tensor], lr: float) -> torch.optim.Optimizer:
-    _add_to_syspath(_sibling_path("Muogi"))
-    try:
-        from muogi import Muogi  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise NotImplementedError(
-            "muogi.Muogi not importable; ensure ../Muogi/ is reachable. "
-            f"Original error: {exc}"
-        ) from exc
+    from bench.optimizers.muogi import Muogi
+
     return Muogi(params, lr=lr)
 
 
 def _build_ramuogi(params: List[torch.Tensor], lr: float) -> torch.optim.Optimizer:
-    _add_to_syspath(_sibling_path("Muogi"))
-    try:
-        from ramuogi import RAMuogi  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise NotImplementedError(
-            "ramuogi.RAMuogi not importable; ensure ../Muogi/ is reachable. "
-            f"Original error: {exc}"
-        ) from exc
+    from bench.optimizers.ramuogi import RAMuogi
+
     return RAMuogi(params, lr=lr)
 
 
 def _build_racaso(params: List[torch.Tensor], lr: float) -> torch.optim.Optimizer:
-    _add_to_syspath(_sibling_path("RACASO"))
-    try:
-        from racaso import RACASO  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise NotImplementedError(
-            "racaso.RACASO not importable; ensure ../RACASO/ is reachable. "
-            f"Original error: {exc}"
-        ) from exc
+    from bench.optimizers.racaso import RACASO
+
     return RACASO(params, lr=lr)
 
 

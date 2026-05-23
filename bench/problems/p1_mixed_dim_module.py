@@ -43,25 +43,25 @@ class P1MixedDimModule(BenchProblem):
     max_steps = 2000
     converged_tol = 1e-2
 
-    def __init__(self, seed: int) -> None:
-        super().__init__(seed)
+    def __init__(self, seed: int, device: str = "cpu") -> None:
+        super().__init__(seed, device=device)
         gen = self._generator
         # Target parameters (held fixed; the optimizer recovers these).
-        self._W_star = torch.randn(_DIM, _DIM, generator=gen) * 0.1
-        self._b_star = torch.randn(_DIM, generator=gen) * 0.1
-        self._gate_star = torch.tensor(1.5)
+        self._W_star = (torch.randn(_DIM, _DIM, generator=gen) * 0.1).to(self.device)
+        self._b_star = (torch.randn(_DIM, generator=gen) * 0.1).to(self.device)
+        self._gate_star = torch.tensor(1.5, device=self.device)
         # Held-out batch of inputs (one batch reused throughout to make
         # the loss landscape stationary across steps).
-        self._x = torch.randn(_BATCH, _DIM, generator=gen)
+        self._x = torch.randn(_BATCH, _DIM, generator=gen).to(self.device)
         # Cache the target output so we don't recompute it.
         with torch.no_grad():
             self._y = (self._x @ self._W_star + self._b_star) * self._gate_star
 
     def init_params(self) -> List[torch.Tensor]:
         gen = self._generator
-        W = torch.randn(_DIM, _DIM, generator=gen) * 0.01
-        b = torch.zeros(_DIM)
-        gate = torch.tensor(1.0)
+        W = (torch.randn(_DIM, _DIM, generator=gen) * 0.01).to(self.device)
+        b = torch.zeros(_DIM, device=self.device)
+        gate = torch.tensor(1.0, device=self.device)
         for p in (W, b, gate):
             p.requires_grad_(True)
         return [W, b, gate]

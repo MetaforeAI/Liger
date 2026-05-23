@@ -39,19 +39,19 @@ class P3WarmupFree(BenchProblem):
     max_steps = 100
     converged_tol = float("inf")  # we judge by loss-at-step-50 separately
 
-    def __init__(self, seed: int) -> None:
-        super().__init__(seed)
+    def __init__(self, seed: int, device: str = "cpu") -> None:
+        super().__init__(seed, device=device)
         gen = self._generator
-        self._W1_star = torch.randn(_HIDDEN, _HIDDEN, generator=gen) * 0.1
-        self._W2_star = torch.randn(_HIDDEN, 1, generator=gen) * 0.1
-        self._x = torch.randn(_BATCH, _HIDDEN, generator=gen)
+        self._W1_star = (torch.randn(_HIDDEN, _HIDDEN, generator=gen) * 0.1).to(self.device)
+        self._W2_star = (torch.randn(_HIDDEN, 1, generator=gen) * 0.1).to(self.device)
+        self._x = torch.randn(_BATCH, _HIDDEN, generator=gen).to(self.device)
         with torch.no_grad():
             self._y = torch.tanh(self._x @ self._W1_star) @ self._W2_star
 
     def init_params(self) -> List[torch.Tensor]:
         gen = self._generator
-        W1 = torch.randn(_HIDDEN, _HIDDEN, generator=gen) * 0.05
-        W2 = torch.randn(_HIDDEN, 1, generator=gen) * 0.05
+        W1 = (torch.randn(_HIDDEN, _HIDDEN, generator=gen) * 0.05).to(self.device)
+        W2 = (torch.randn(_HIDDEN, 1, generator=gen) * 0.05).to(self.device)
         for p in (W1, W2):
             p.requires_grad_(True)
         return [W1, W2]

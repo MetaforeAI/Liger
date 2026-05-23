@@ -45,19 +45,20 @@ class P5RouterCorrectness(BenchProblem):
 
     def init_params(self) -> List[torch.Tensor]:
         params: List[torch.Tensor] = []
+        d = self.device
         # Scalars (ndim = 0).
         for _ in range(3):
-            params.append(torch.tensor(0.5, requires_grad=True))
+            params.append(torch.tensor(0.5, device=d, requires_grad=True))
         # Vectors (ndim = 1).
-        params.append(torch.randn(8, requires_grad=True))
-        params.append(torch.randn(16, requires_grad=True))
+        params.append(torch.randn(8, device=d, requires_grad=True))
+        params.append(torch.randn(16, device=d, requires_grad=True))
         # Matrices (ndim = 2).
         for size in [(4, 4), (8, 16), (16, 32), (32, 32)]:
-            params.append(torch.randn(*size, requires_grad=True))
+            params.append(torch.randn(*size, device=d, requires_grad=True))
         # 3-D tensor.
-        params.append(torch.randn(2, 3, 4, requires_grad=True))
+        params.append(torch.randn(2, 3, 4, device=d, requires_grad=True))
         # 4-D tensor (mock-conv-weight shape).
-        params.append(torch.randn(2, 3, 3, 3, requires_grad=True))
+        params.append(torch.randn(2, 3, 3, 3, device=d, requires_grad=True))
         return params
 
     def forward(self, params: List[torch.Tensor]) -> torch.Tensor:

@@ -9,5 +9,6 @@ backups/
 .venv/
 venv/
 .DS_Store
-results.csv
-figs/
+
+# Bench artifacts (results.csv, sweep.log, figs/) ARE committed —
+# they are the verification trail for the paper's §9 claims.

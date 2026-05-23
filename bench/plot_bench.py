@@ -72,7 +72,7 @@ def _best_lr(rows: List[dict]) -> dict:
 
 
 def fig1_p1_loss_curves(rows: List[dict], out: Path) -> None:
-    sub = _filter(rows, problem="p1_mixed_dim_module")
+    sub = _filter(rows, problem="p1")
     opts = sorted({r["optimizer"] for r in sub})
     fig, ax = plt.subplots(figsize=(8, 5))
     for opt in opts:
@@ -118,7 +118,7 @@ def fig1_p1_loss_curves(rows: List[dict], out: Path) -> None:
 
 
 def fig2_p2_v_hat_trajectories(rows: List[dict], out: Path) -> None:
-    sub = _filter(rows, problem="p2_scalar_burst")
+    sub = _filter(rows, problem="p2")
     opts = sorted({r["optimizer"] for r in sub})
     fig, ax = plt.subplots(figsize=(8, 5))
     # We don't have a per-step v_hat trajectory in the CSV — only the
@@ -163,7 +163,7 @@ def fig2_p2_v_hat_trajectories(rows: List[dict], out: Path) -> None:
 
 
 def fig3_p3_early_loss(rows: List[dict], out: Path) -> None:
-    sub = _filter(rows, problem="p3_warmup_free")
+    sub = _filter(rows, problem="p3")
     opts = sorted({r["optimizer"] for r in sub})
     checkpoints = [1, 5, 50]
     data: Dict[str, List[float]] = {}
@@ -215,7 +215,7 @@ def fig3_p3_early_loss(rows: List[dict], out: Path) -> None:
 
 
 def fig4_p4_state_bytes(rows: List[dict], out: Path) -> None:
-    sub = _filter(rows, problem="p4_memory_scaling")
+    sub = _filter(rows, problem="p4")
     by_opt: Dict[str, int] = {}
     for r in sub:
         try:
@@ -248,7 +248,7 @@ def fig4_p4_state_bytes(rows: List[dict], out: Path) -> None:
 
 
 def fig5_p5_router_census(rows: List[dict], out: Path) -> None:
-    sub = _filter(rows, problem="p5_router_correctness", optimizer="liger")
+    sub = _filter(rows, problem="p5", optimizer="liger")
     if not sub:
         print(f"no P5 / liger data; skipping {out}")
         return

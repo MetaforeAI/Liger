@@ -42,14 +42,14 @@ class P2ScalarBurst(BenchProblem):
     max_steps = 500
     converged_tol = 1.0  # max distance from drifting target
 
-    def __init__(self, seed: int) -> None:
-        super().__init__(seed)
+    def __init__(self, seed: int, device: str = "cpu") -> None:
+        super().__init__(seed, device=device)
         self._step = 0
         # Target drifts very slowly: t -> 1.0 + 0.001 * step.
         # The optimizer should keep p tracking close to this.
 
     def init_params(self) -> List[torch.Tensor]:
-        p = torch.tensor(0.0, requires_grad=True)
+        p = torch.tensor(0.0, device=self.device, requires_grad=True)
         return [p]
 
     def _target(self) -> float:
@@ -74,7 +74,7 @@ class P2ScalarBurst(BenchProblem):
             magnitude = _BURST_MAGNITUDE
         else:
             magnitude = _NORMAL_MAGNITUDE
-        grad = torch.tensor(direction * magnitude)
+        grad = torch.tensor(direction * magnitude, device=self.device)
         self._step += 1
         return loss, [grad]
 
