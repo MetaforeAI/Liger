@@ -373,7 +373,13 @@ This is the same architectural pattern Morpheus uses at the model level — dist
 
 ## 9. Empirical Results
 
-The five benchmark problems isolate the analytical claims from §4 against five baseline optimizers (`adam`, `adamw`, `yogi`, `lion`, `liger` + comparison `muogi`, `ramuogi`, `racaso`). Full sweep results are produced by `bench/run_bench.py --sweep` on GPU (RunPod / leased H100). Numbers below are placeholders to be populated after the GPU sweep.
+The benchmark suite comprises two layers:
+
+- **Five synthetic problems (P1–P5)** that isolate the analytical claims from §4 against five baseline optimizers (`adam`, `adamw`, `yogi`, `lion`, `liger`) and three sibling family optimizers (`muogi`, `ramuogi`, `racaso`). Each problem is surgical: it instruments one specific property (router dispatch, scalar burst recovery, warmup independence, memory footprint, router correctness) so the result maps cleanly to the analytical claim it tests.
+
+- **Three real-task problems (R1 CIFAR-10 ResNet-18, R2 char-LM on tiny-shakespeare, R3 NanoGPT byte-level on WikiText-2)** that demonstrate the optimizer works on industry-credible architectures, not just toy quadratics. R1 is the canonical "does this optimizer train a real image classifier" gate; R2 is the Karpathy-canonical lightweight LM gate; R3 is NanoGPT-scale (~30M params), the scale at which independent optimizer papers establish credibility.
+
+All sweeps run via `bench/run_bench.py --sweep --device cuda` on an NVIDIA RTX A4500 (20GB), with per-optimizer LR grids (Lion-family optimizers receive 3–10× lower LRs than Adam-family) and seeds {0, 1, 2} (synthetic problems) or {0, 1} (real-task problems, where each run is more expensive). Raw results: `bench/results.csv`. Figures: `bench/figs/*.png`.
 
 ### 9.1 P1 — Mixed-Dim Module (Headline)
 
@@ -462,6 +468,96 @@ This is the empirical refutation of the "one optimizer covers everything" assump
 The trace does *not* substitute for the controlled head-to-head comparison in §9.1-§9.5. It does not show Liger outperforming AdamW on a fixed benchmark; it shows Liger running stably as the chosen tool on the organ its design targets, inside an architecture where eleven other organs are using eleven other optimizers. Both kinds of evidence matter, and the paper's claim is that **the dispatch decision** — choosing Liger for RAH specifically — is the right kind of decision an optimizer paper should be defending, rather than the one-rule-for-everything decision the field defaults to.
 
 The trace also illustrates the diagnostic interface from §7 working as designed: a single one-line telemetry print at each logged step gives a complete picture of dispatch census, Lion-path health, and Yogi-path health — small enough to embed in an existing training log without bloating the output, and self-explanatory enough that a reviewer can verify the §4.1 claim from the log alone.
+
+### 9.7 R1 — CIFAR-10 ResNet-18
+
+**Setup.** Standard ResNet-18 (~11.2M params, vendored at `bench/models/resnet18.py`) on CIFAR-10 train split. 5000 steps, batch 128, no LR warmup, no cosine schedule (constant LR per run so the optimizer is doing all the work). Cross-entropy loss; convergence threshold train loss < 0.5.
+
+**Why this problem.** This is the canonical "does this optimizer work on a real model" gate in every optimizer paper since Adam. A new optimizer that fails on CIFAR-10 ResNet-18 is not publishable; conversely, an optimizer that converges here cannot be dismissed as toy-data-only.
+
+**Results.**
+
+| Optimizer | Best LR | Final train loss | Steps to converge | Wall-clock μs/step |
+|---|---|---|---|---|
+| AdamW | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| Yogi | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| Lion | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| **Liger** | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| Muogi | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| RAMuogi | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| RACASO | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+
+(See `bench/figs/fig6_r1_cifar10.png` for full loss curves.)
+
+### 9.8 R2 — Char-LM on tiny-shakespeare
+
+**Setup.** Small char-level transformer (~3M params, vendored at `bench/models/charlm.py`): 4 layers, hidden 256, 4 heads, vocab 128 (ASCII). Trained on tiny-shakespeare (1.1MB, vendored at `bench/datasets/tinyshakespeare.txt`) for 3000 steps, batch 32, sequence length 128. Cross-entropy loss; convergence threshold train loss < 1.5 (uniform-prior char baseline ≈ 4.85).
+
+**Why this problem.** Karpathy-canonical lightweight LM gate. Every LM optimizer claim has tiny-shakespeare somewhere as the "does it train language at all" sanity check.
+
+**Results.**
+
+| Optimizer | Best LR | Final train loss | Steps to converge |
+|---|---|---|---|
+| AdamW | _TBD_ | _TBD_ | _TBD_ |
+| Yogi | _TBD_ | _TBD_ | _TBD_ |
+| Lion | _TBD_ | _TBD_ | _TBD_ |
+| **Liger** | _TBD_ | _TBD_ | _TBD_ |
+| Muogi | _TBD_ | _TBD_ | _TBD_ |
+| RAMuogi | _TBD_ | _TBD_ | _TBD_ |
+| RACASO | _TBD_ | _TBD_ | _TBD_ |
+
+(See `bench/figs/fig7_r2_charlm.png` for full loss curves.)
+
+### 9.9 R3 — NanoGPT (byte-level) on WikiText-2
+
+**Setup.** 6-layer NanoGPT (~30M params, vendored at `bench/models/nanogpt.py`): hidden 384, 6 heads, byte-level vocab 256, sequence length 256. Trained on WikiText-2-raw (13MB, downloaded on first call) for 1000 steps, batch 8 (= 2048 bytes/step). Cross-entropy loss; convergence threshold train loss < 5.0 (uniform 256-class baseline ≈ 5.55).
+
+**Why this problem.** NanoGPT-scale is the credibility floor for independent LM optimizer papers: not GPT-2-small full scale (which would dominate runtime), but enough capacity to require real optimization signal rather than just memorization. Byte-level tokenization keeps the bench dependency-free — no `transformers`, no `tokenizers`, no pretrained merges JSON. Byte-level LMs are a legitimate published practice (ByT5, MEGABYTE).
+
+**Results.**
+
+| Optimizer | Best LR | Final train loss | Steps to converge |
+|---|---|---|---|
+| AdamW | _TBD_ | _TBD_ | _TBD_ |
+| Yogi | _TBD_ | _TBD_ | _TBD_ |
+| Lion | _TBD_ | _TBD_ | _TBD_ |
+| **Liger** | _TBD_ | _TBD_ | _TBD_ |
+| Muogi | _TBD_ | _TBD_ | _TBD_ |
+| RAMuogi | _TBD_ | _TBD_ | _TBD_ |
+| RACASO | _TBD_ | _TBD_ | _TBD_ |
+
+(See `bench/figs/fig8_r3_nanogpt.png` for full loss curves.)
+
+### 9.10 Comparison with sibling family optimizers (Muogi, RAMuogi, RACASO)
+
+The Liger benchmark suite runs against **all three sibling-family optimizers** developed in this lineage — Muogi, RAMuogi, and RACASO — because each is published as a separate ArXiv submission with overlapping baselines, and cross-citation between them strengthens all four papers. The vendoring rule in `bench/optimizers/` is uniform: every optimizer appears as a standalone source file, treating sibling-family optimizers exactly like external baselines.
+
+**Where each sibling wins.**
+
+- **Muogi (sign-momentum + NS5 orthogonalization on matrices)** is expected to outperform Liger on R1 CIFAR-10 because ResNet-18's convolutional matrices benefit from spectral orthogonalization; Lion-only and Liger-on-matrices both produce sign-momentum updates without this preconditioning, which is structurally what NS5 provides.
+- **RAMuogi (RAdam-rectified Muogi)** should beat Liger on R3 NanoGPT specifically because byte-level LMs have ill-conditioned `v_hat` in the first hundred steps (rare bytes dominate the gradient occasionally), where RAMuogi's L4 cold-start gate suppresses spurious updates that Liger's Yogi-on-scalars path does not gate.
+- **RACASO (Hutchinson HVP or GNB) with Sophia-style clipping** is expected to outperform Liger on problems where second-order curvature information matters — but at the cost of an expensive HVP refresh every `hessian_freq` steps. On the cheap-to-train benchmarks here (R1/R2/R3), RACASO's overhead may dominate the curvature benefit.
+
+**Where Liger wins.**
+
+- **Memory.** Liger's optimizer state at the 1B-equivalent scale (P4) is ~50% of AdamW's. Muogi and RAMuogi both pay full Adam-state-memory because Yogi-on-matrices needs the full `v_t` buffer. RACASO pays *more* than AdamW because of its rotated-basis matrices.
+- **Cold-start steps 1–10.** Liger's Lion route is operational from step 1 with no `v_t` accumulator (§4.1); RAMuogi's L4 cold-start gate suppresses both the spurious *and* the legitimate cold-start updates equally.
+- **Dispatch overhead.** Liger does one ndim check per parameter at construction; the other three sibling family optimizers do per-step routing logic.
+
+**Cross-comparison figure.** See `bench/figs/cross_comparison.png` — a single multi-panel figure overlaying all 8 optimizers (the 5 baselines + the 3 siblings) on R1/R2/R3. The same figure appears in `Muogi/RAMuogi_Paper.md` §9 and `RACASO/RACASO_Paper.md` §9 so a reviewer reading any one paper sees the unified head-to-head.
+
+**Unified head-to-head table** (same content across all 3 papers; this paper highlights Liger):
+
+| Optimizer | R1 final loss | R2 final loss | R3 final loss | State bytes (% of AdamW) |
+|---|---|---|---|---|
+| AdamW | _TBD_ | _TBD_ | _TBD_ | 100.00% |
+| Yogi | _TBD_ | _TBD_ | _TBD_ | 100.00% |
+| Lion | _TBD_ | _TBD_ | _TBD_ | 50.00% |
+| **Liger** | _TBD_ | _TBD_ | _TBD_ | **~50%** |
+| Muogi | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| RAMuogi | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| RACASO | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 
 ---
 
