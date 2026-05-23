@@ -71,6 +71,26 @@ Liger contributes:
 
 Liger does *not* contribute novel algorithms; the Lion and Yogi updates are unmodified. The novelty is in admitting that they should coexist within a single optimizer instance, and in identifying the structural condition (parameter shape, used as a proxy for gradient regime) under which that coexistence is principled.
 
+### 1.5 Lineage
+
+This paper is one of three (Liger, Muogi/RAMuogi, RACASO) describing optimizers developed sequentially against distinct production failure modes in the Morpheus architecture. The arc, with multiple production attempts at each stage anchoring the receipts:
+
+1. **SOAP** worked on the X-organ (a cross-branch interaction surface) until a branching-norm aggregation introduced second-order coupling that broke SOAP's Kronecker factorization assumption — row dependencies coupled to column dependencies via the shared joint-norm denominator.
+
+2. **Muogi v1** (`logs/v17_2_muogi/`): Yogi-injected NS5 with a relative-threshold spread cap. Solved the immediate X-organ stability problem but its own pathologies surfaced (the L1/L2/L3 safety chain that the Muogi paper documents).
+
+3. **Muogi v2** (`logs/v17_3_muogi_v2_attempt1..4/`): four attempts iterating on the safety chain. Attempt 4 reached a stable configuration with `grad[x] ≈ 2.62` and bounded `lc mass`. The four-attempt sequence is itself the documentation that the safety chain matters — earlier attempts failed differently each time.
+
+4. **RAMuogi** (`logs/v17_4_ramuogi/`): added a RAdam cold-start gate (L4) on top of Muogi v2, inspired by RAdam's variance-rectification mechanism. Achieved better gradient health (`grad[x] ≈ 2.50`) than any Muogi attempt.
+
+5. **RACASO** (`logs/v17_5_racaso/` + `v17_5_racaso_attempt1..3/`): rotated-basis Adam + Hutchinson HVP + Sophia-style clipping in the rotated basis, inspired by RACASO's namesakes RAdam, CASPR, and SOAP itself. Four attempts — and the iteration sequence itself is the design history of RACASO's safety chain. Attempts 1 and 3 NaN'd out on the X-organ; the NaN signature was **the same branching-norm second-order coupling pathology that originally broke SOAP**. Same upstream cause, same downstream symptom, just routed through RACASO's rotated-basis machinery instead of SOAP's Kronecker factorization. Each NaN was a diagnostic surface that built one of RACASO's documented safety layers: the L1 spread cap, the L2 eigh-residual safe-skip, the L3 vanilla-Yogi fallback, the L4 RAdam cold-start gate, and the L5 DivBackward0 absorb-and-continue. **Attempt 2 ran clean** with finite `Δ total` and `grad[x] ≈ 4.62`, demonstrating that with the safety chain debugged the optimizer reaches a working state. The L5 hazard documented in the RACASO paper §6/§7 names the pathology as a class — not RACASO-specific, but a general failure mode for any second-order-aware optimizer that traverses a forward graph with unbounded second derivatives.
+
+6. Once RACASO's **L5 absorb** cleared the DivBackward0 hazard on the X-organ, we noticed the path was clean enough to *reintroduce* SOAP. The L5 wasn't a RACASO-specific fix; it was a general pattern for surviving the divergent-2nd-derivative regime that had broken SOAP originally. Returning **SOAP + Shampoo** to X with that absorb logic in place produced a configuration that outperforms RACASO. Shampoo's Kronecker maintenance is more efficient than RACASO's full eigendecomp + HVP refresh; the `shampoo[x]` production log (`logs/neo*/`) shows `eig_fallback=0` consistently across runs. The full arc — SOAP breaks on branching-norm coupling → Muogi/RAMuogi/RACASO build the safety chain that survives it → SOAP+Shampoo returns to X carrying that learned absorb pattern — is the actual contribution of the family.
+
+7. **Liger** (`logs/neo_v2.2/`) was born from a *different* failure mode discovered on the RAH (Recursive Adaptive Hub) organ, not X. The smoking-gun diagnostic from RAMuogi-on-RAH (`logs/neo_v2.1/neo_v2.1_training.log`) was `ramuogi[rah] ns5_ok=0` for every logged step — RAMuogi's NS5 found nothing to orthogonalize because RAH's gradients arrive *already* well-conditioned from upstream RMSNorm. RAH needed bounded direction on matrices without preconditioning (Lion) and burst-safe variance handling on scalars (Yogi). The dispatch decision RAMuogi already encoded (by parameter dimensionality) survived; only the matrix-side update rule changed. That is what Liger is.
+
+The four optimizers do not compete; they solve different problem classes. SOAP+Shampoo beats RACASO on X. Muogi was a step toward the right answer for X but not the final answer. RAMuogi was wrong for RAH specifically (right tool, wrong workpiece — its design assumed ill-conditioned matrix gradients that RAH does not produce). Liger is the right answer for RAH, where matrix gradients are pre-conditioned and the optimizer should not waste compute trying to precondition them again. We publish all four because the failure-and-response sequence is the actual scientific record, and because cross-citation between the four papers gives the family arc its proper context. See §9.10 for measured numbers from the production traces that establish each claim.
+
 ---
 
 ## 2. The Liger Architecture
