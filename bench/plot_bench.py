@@ -1,11 +1,16 @@
-"""Render the five paper figures from a results.csv produced by run_bench.
+"""Render the paper figures from a results.csv produced by run_bench.
 
-Figures:
+Synthetic problems (figs 1-5):
   fig1_p1_loss_curves.png        — P1, loss-vs-step across optimizers (log-y)
   fig2_p2_v_hat_trajectories.png — P2, v_hat trajectories across optimizers
   fig3_p3_early_loss.png         — P3, loss at step 1, 5, 50 bar chart
   fig4_p4_state_bytes.png        — P4, optimizer-state bytes bar chart
   fig5_p5_router_census.png      — P5, telemetry counts vs ground truth
+
+Real-task problems (figs 6-8), if present in the CSV:
+  fig6_r1_cifar10.png            — R1, CIFAR-10 ResNet-18 loss + state bytes
+  fig7_r2_charlm.png             — R2, char-LM loss curves
+  fig8_r3_nanogpt.png            — R3, NanoGPT loss curves
 
 Usage:
     python bench/plot_bench.py --input results.csv --output figs/
@@ -277,6 +282,92 @@ def fig5_p5_router_census(rows: List[dict], out: Path) -> None:
     print(f"wrote {out}")
 
 
+# ── Figures 6-8: real-task loss curves ───────────────────────────────────
+
+
+def _real_task_loss_curves(rows: List[dict], problem: str, title: str, out: Path) -> None:
+    """Plot loss-vs-step for a real-task problem (R1/R2/R3).
+
+    One line per optimizer, averaged across seeds, best LR per optimizer.
+    """
+    import numpy as np
+
+    sub = _filter(rows, problem=problem)
+    if not sub:
+        print(f"no {problem} data; skipping {out}")
+        return
+    opts = sorted({r["optimizer"] for r in sub})
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for opt in opts:
+        candidates = [r for r in sub if r["optimizer"] == opt]
+        # Find best LR by mean final loss.
+        by_lr: Dict[str, List[dict]] = {}
+        for r in candidates:
+            by_lr.setdefault(r["lr"], []).append(r)
+        def _score(lst):
+            vals = []
+            for r in lst:
+                try:
+                    v = float(r["final_loss"])
+                    if v == v and v != float("inf"):  # not NaN/Inf
+                        vals.append(v)
+                except (TypeError, ValueError):
+                    continue
+            return sum(vals) / len(vals) if vals else float("inf")
+        if not by_lr:
+            continue
+        best_lr = min(by_lr, key=lambda k: _score(by_lr[k]))
+        chosen = by_lr[best_lr]
+        trajs = [_parse_trajectory(r["loss_trajectory"]) for r in chosen]
+        trajs = [t for t in trajs if t]
+        if not trajs:
+            continue
+        max_len = max(len(t) for t in trajs)
+        padded = [t + [t[-1]] * (max_len - len(t)) for t in trajs]
+        avg = [sum(col) / len(col) for col in zip(*padded)]
+        ax.plot(
+            range(1, len(avg) + 1),
+            avg,
+            color=_OPTIMIZER_COLORS.get(opt, "#000"),
+            label=f"{opt} (lr={best_lr})",
+            linewidth=1.5,
+        )
+    ax.set_yscale("log")
+    ax.set_xlabel("step")
+    ax.set_ylabel("loss (log)")
+    ax.set_title(title)
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(loc="upper right", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"wrote {out}")
+
+
+def fig6_r1_cifar10(rows: List[dict], out: Path) -> None:
+    _real_task_loss_curves(
+        rows, "r1_cifar10_resnet18",
+        "R1 — CIFAR-10 ResNet-18: training loss",
+        out,
+    )
+
+
+def fig7_r2_charlm(rows: List[dict], out: Path) -> None:
+    _real_task_loss_curves(
+        rows, "r2_charlm_shakespeare",
+        "R2 — Char-LM on tiny-shakespeare: training loss",
+        out,
+    )
+
+
+def fig8_r3_nanogpt(rows: List[dict], out: Path) -> None:
+    _real_task_loss_curves(
+        rows, "r3_nanogpt_wikitext2",
+        "R3 — NanoGPT on WikiText-2: training loss",
+        out,
+    )
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────
 
 
@@ -295,6 +386,9 @@ def main() -> None:
     fig3_p3_early_loss(rows, args.output / "fig3_p3_early_loss.png")
     fig4_p4_state_bytes(rows, args.output / "fig4_p4_state_bytes.png")
     fig5_p5_router_census(rows, args.output / "fig5_p5_router_census.png")
+    fig6_r1_cifar10(rows, args.output / "fig6_r1_cifar10.png")
+    fig7_r2_charlm(rows, args.output / "fig7_r2_charlm.png")
+    fig8_r3_nanogpt(rows, args.output / "fig8_r3_nanogpt.png")
 
 
 if __name__ == "__main__":
