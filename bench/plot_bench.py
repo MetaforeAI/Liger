@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import sys
+csv.field_size_limit(sys.maxsize)
 from pathlib import Path
 from typing import Dict, List
 
@@ -40,10 +42,35 @@ _OPTIMIZER_COLORS = {
     "racaso":  "#e377c2",   # pink
 }
 
+# Per-figure optimizer exclusions for this paper.
+#
+# RACASO is excluded from Liger's figures. RACASO's design domain
+# (second-order curvature on saddle/DivBackward0 surfaces) is a
+# different problem class than Liger targets (mixed-dim transformer
+# routing layers), and its comparative results don't belong in figures
+# meant to communicate Liger's dispatch decision vs Adam-family vs
+# Lion-family. RACASO's R3 NanoGPT divergence (final loss ~50 vs the
+# cluster at ~4.7) is documented in the paper text (§9.9 and the
+# unified head-to-head table); we don't need to also show it visually.
+# RACASO's own paper carries its full results.
+_EXCLUDED_OPTIMIZERS: set[str] = {"racaso"}
+
+
+def _exclude_optimizers(rows: List[dict]) -> List[dict]:
+    """Filter out optimizers that aren't relevant to this paper's figures."""
+    if not _EXCLUDED_OPTIMIZERS:
+        return rows
+    return [r for r in rows if r["optimizer"] not in _EXCLUDED_OPTIMIZERS]
+
 
 def _read_rows(path: Path) -> List[dict]:
     with path.open() as f:
-        return list(csv.DictReader(f))
+        rows = list(csv.DictReader(f))
+    # Apply the paper-level optimizer exclusion at the read boundary so
+    # every downstream figure sees a filtered row set without per-figure
+    # changes. RACASO results are still in results.csv for verification;
+    # we just don't render them in this paper's figures.
+    return _exclude_optimizers(rows)
 
 
 def _filter(rows: List[dict], **kw) -> List[dict]:
