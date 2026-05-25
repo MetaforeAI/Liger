@@ -177,13 +177,28 @@ def fig1_p1_loss_curves(rows: List[dict], out: Path) -> None:
 
 
 def fig2_p2_v_hat_trajectories(rows: List[dict], out: Path) -> None:
+    """Two-panel P2 figure.
+
+    Left: Liger's `last_max_v_hat` per LR (the post-burst residual that
+    motivates Yogi's bounded v_t rule). Only Liger exposes v_hat through
+    the harness's telemetry interface — adding AdamW's v_hat would
+    require an offline reconstruction from the loss trajectory, which
+    is more brittle than just showing the comparative *loss* trajectory.
+
+    Right: best-LR loss trajectory for every optimizer present (Liger,
+    AdamW, plus the rest of the sweep). Liger does not win on this
+    benchmark — the per-family LR grid forces Liger's Yogi path into a
+    regime that is appropriate for Lion-on-matrices but too low for
+    scalar-only Yogi. Showing the comparative loss curves makes the
+    honest result visible to the reader without requiring a separate
+    bytes-of-state argument from the text.
+    """
     sub = _filter(rows, problem="p2")
     opts = sorted({r["optimizer"] for r in sub})
-    fig, ax = plt.subplots(figsize=(8, 5))
-    # We don't have a per-step v_hat trajectory in the CSV — only the
-    # final v_hat. So this figure plots the *final* v_hat across seeds
-    # per optimizer × LR as a scatter, with the y-axis on log scale.
-    # A future enhancement would emit a per-step v_hat trajectory column.
+
+    fig, (ax_v, ax_loss) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # ── Left: Liger v_hat scatter, per LR ─────────────────────────────
     for opt in opts:
         xs, ys = [], []
         for r in sub:
@@ -198,20 +213,53 @@ def fig2_p2_v_hat_trajectories(rows: List[dict], out: Path) -> None:
             xs.append(float(r["lr"]))
             ys.append(v)
         if xs:
-            ax.scatter(
+            ax_v.scatter(
                 xs,
                 ys,
                 color=_OPTIMIZER_COLORS.get(opt, "#000"),
                 label=opt,
                 s=40,
             )
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("learning rate")
-    ax.set_ylabel("final last_max_v_hat (log)")
-    ax.set_title("P2 — Scalar Burst: post-burst v_hat residual")
-    ax.grid(True, which="both", alpha=0.3)
-    ax.legend()
+    ax_v.set_xscale("log")
+    ax_v.set_yscale("log")
+    ax_v.set_xlabel("learning rate")
+    ax_v.set_ylabel("final last_max_v_hat (log)")
+    ax_v.set_title("P2 — Liger Yogi v_hat residual per LR")
+    ax_v.grid(True, which="both", alpha=0.3)
+    ax_v.legend(fontsize=8)
+
+    # ── Right: best-LR loss trajectory for every optimizer ────────────
+    for opt in opts:
+        opt_rows = [r for r in sub if r["optimizer"] == opt]
+        by_lr: Dict[str, List[dict]] = {}
+        for r in opt_rows:
+            by_lr.setdefault(r["lr"], []).append(r)
+        if not by_lr:
+            continue
+        best_lr = min(
+            by_lr,
+            key=lambda k: sum(float(r["final_loss"]) for r in by_lr[k])
+            / len(by_lr[k]),
+        )
+        trajs = [_parse_trajectory(r["loss_trajectory"]) for r in by_lr[best_lr]]
+        trajs = [t for t in trajs if t]
+        if not trajs:
+            continue
+        min_len = min(len(t) for t in trajs)
+        truncated = [t[:min_len] for t in trajs]
+        avg = [sum(c) / len(c) for c in zip(*truncated)]
+        ax_loss.plot(
+            range(1, len(avg) + 1), avg,
+            color=_OPTIMIZER_COLORS.get(opt, "#000"),
+            linewidth=0.7, alpha=0.85,
+            label=f"{opt} (lr={best_lr})",
+        )
+    ax_loss.set_xlabel("step")
+    ax_loss.set_ylabel("loss")
+    ax_loss.set_title("P2 — best-LR loss trajectory (8 optimizers)")
+    ax_loss.grid(True, which="both", alpha=0.25, linewidth=0.5)
+    ax_loss.legend(fontsize=8)
+
     fig.tight_layout()
     fig.savefig(out, dpi=150)
     plt.close(fig)
@@ -243,9 +291,14 @@ def fig3_p3_early_loss(rows: List[dict], out: Path) -> None:
             _parse_trajectory(r["loss_trajectory"])
             for r in by_lr[best_lr]
         ]
-        max_len = max(len(t) for t in trajs)
-        padded = [t + [t[-1]] * (max_len - len(t)) for t in trajs]
-        avg = [sum(col) / len(col) for col in zip(*padded)]
+        trajs = [t for t in trajs if t]
+        if not trajs:
+            continue
+        # Truncate to min-length (unified aggregation policy; see
+        # bench/README.md for rationale).
+        min_len = min(len(t) for t in trajs)
+        truncated = [t[:min_len] for t in trajs]
+        avg = [sum(col) / len(col) for col in zip(*truncated)]
         data[opt] = [avg[min(c - 1, len(avg) - 1)] for c in checkpoints]
     fig, ax = plt.subplots(figsize=(8, 5))
     width = 0.8 / max(1, len(data))
@@ -391,11 +444,24 @@ def _real_task_loss_curves(rows: List[dict], problem: str, title: str, out: Path
         trajs = [t for t in trajs if t]
         if not trajs:
             continue
-        max_len = max(len(t) for t in trajs)
-        padded = [t + [t[-1]] * (max_len - len(t)) for t in trajs]
-        avg = [sum(col) / len(col) for col in zip(*padded)]
+        # Truncate to the shortest seed's length rather than padding to
+        # the longest. Padding-with-final-value implicitly claims that
+        # all seeds were observed at every step, which they were not;
+        # the shortest-seed truncate is the honest aggregation. Mirrors
+        # the policy used in plot_cross_comparison.py — see bench/README.md.
+        min_len = min(len(t) for t in trajs)
+        if min_len == 0:
+            continue
+        truncated = [t[:min_len] for t in trajs]
+        avg = [sum(col) / len(col) for col in zip(*truncated)]
+        # Report the same smoothed-final-loss policy as run_bench.py:
+        # mean over the last 50 steps when the trajectory is long enough.
+        if len(avg) >= 50:
+            tail = avg[-50:]
+            final_by_opt[opt] = sum(tail) / len(tail)
+        else:
+            final_by_opt[opt] = avg[-1] if avg else float("inf")
         avg_by_opt[opt] = avg
-        final_by_opt[opt] = avg[-1] if avg else float("inf")
         lr_by_opt[opt] = best_lr
 
     if not avg_by_opt:

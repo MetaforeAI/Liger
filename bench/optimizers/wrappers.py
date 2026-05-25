@@ -17,8 +17,11 @@ Canonical configs (single source of truth):
     adamw    : torch.optim.AdamW(lr, betas=(0.9, 0.999), eps=1e-8, wd=0.01)
     yogi     : Yogi(lr, betas=(0.9, 0.999), eps=1e-3, init_acc=1e-6, wd=0.0)
                — bench/optimizers/yogi.py (Zaheer et al. 2018)
-    lion     : Lion(lr, betas=(0.9, 0.99), wd=0.0)
+    lion     : Lion(lr, betas=(0.9, 0.9), wd=0.0)
                — bench/optimizers/lion.py (Chen et al. 2023)
+               — β1 = β2 = 0.9 to match Liger's one-coefficient
+                 simplification (see Liger_Paper.md §2.1); the published
+                 Lion default (0.9, 0.99) is intentionally NOT used here.
     liger    : Liger(lr, betas=(0.9, 0.99), eps_yogi=1e-3, wd=0.0)
                — bench/optimizers/liger.py (vendored from sibling repo)
     muogi    : Muogi(lr, default Muogi config)
@@ -77,7 +80,15 @@ def _build_yogi(params: List[torch.Tensor], lr: float) -> torch.optim.Optimizer:
 def _build_lion(params: List[torch.Tensor], lr: float) -> torch.optim.Optimizer:
     from bench.optimizers.lion import Lion
 
-    return Lion(params, lr=lr, betas=(0.9, 0.99), weight_decay=0.0)
+    # β1 = β2 = 0.9 matches Liger's internal one-coefficient simplification
+    # (Liger collapses Lion's two β's into a shared coefficient — see
+    # Liger_Paper.md §2.1). Running the Lion baseline with the published
+    # two-coefficient default `(0.9, 0.99)` would make the comparison
+    # against Liger off-axis: Liger's matrix path would be one-coefficient
+    # Lion while the "Lion" baseline is two-coefficient Lion. We pin Lion
+    # to `(0.9, 0.9)` so the only structural difference between Lion and
+    # Liger is dispatch-by-ndim.
+    return Lion(params, lr=lr, betas=(0.9, 0.9), weight_decay=0.0)
 
 
 def _build_liger(params: List[torch.Tensor], lr: float) -> torch.optim.Optimizer:

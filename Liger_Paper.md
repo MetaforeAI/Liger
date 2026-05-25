@@ -14,7 +14,7 @@
 
 We introduce **Liger** — *Layered Iterative Gradient Estimator with Rectification* — a hybrid optimizer for neural networks with mixed parameter shapes. Liger partitions parameters by tensor dimensionality at construction time and routes each partition to a different update rule: matrix-shaped parameters (`ndim ≥ 2`) take a Lion sign-momentum step, while vector- and scalar-shaped parameters (`ndim ≤ 1`) take a Yogi variance-rectified step. The two ancestor algorithms are unmodified; the contribution is structural.
 
-This split is motivated by two pathologies that affect single-update-rule optimizers in mixed-dimensional architectures. **Pathology A — adaptive warmup coupling.** Adam-family optimizers rely on bias-corrected second moments (`v_hat`) that are statistically meaningless for the first 5-50 steps, requiring a rectification gate or LR warmup that interacts pathologically with the LR warmup practitioners already stack on top. Lion's sign-momentum update has no second moment and is operational from step 1. **Pathology B — rank-1 destruction on scalars.** Adam's `m / sqrt(v + ε)` step normalizes per-element variance and destroys the rank-1 burst structure of scalar-gate gradients; Yogi's bounded `v_t` update preserves it. Liger applies each ancestor to the regime it was designed for and gets warmup-independence, scalar burst-safety, and approximately 55% of AdamW's optimizer-state memory in a single optimizer instance.
+This split is motivated by two pathologies that affect single-update-rule optimizers in mixed-dimensional architectures. **Pathology A — adaptive warmup coupling.** Adam-family optimizers rely on bias-corrected second moments (`v_hat`) that are statistically meaningless for the first 5-50 steps, requiring a rectification gate or LR warmup that interacts pathologically with the LR warmup practitioners already stack on top. Lion's sign-momentum update has no second moment and is operational from step 1. **Pathology B — rank-1 destruction on scalars.** Adam's `m / sqrt(v + ε)` step normalizes per-element variance and destroys the rank-1 burst structure of scalar-gate gradients; Yogi's bounded `v_t` update preserves it. Liger applies each ancestor to the regime it was designed for and gets warmup-independence, scalar burst-safety, and approximately 50% of AdamW's optimizer-state memory in a single optimizer instance (measured at 50.02% on a 1B-parameter-equivalent transformer in §9.4).
 
 This document specifies the algorithm, derives the warmup-independence and memory-footprint claims analytically, names the regimes where Liger is *not* the right tool (ill-conditioned matrices, ill-conditioned scalars near saturation), and lays out a five-problem benchmark suite to validate the empirical claims on GPU.
 
@@ -130,6 +130,8 @@ We use `β2 = 0.99` by default (rather than Adam's typical 0.999) because Yogi's
 
 We use `ε_yogi = 1e-3` (Yogi paper default, larger than Adam's 1e-8) as the floor on `sqrt(v_hat)`. The larger floor makes the 1-D path robust to near-zero `v_hat` at cold-start without needing a separate rectification gate.
 
+**Implementation note on the Yogi denominator.** The vendored standalone Yogi at `bench/optimizers/yogi.py:92` builds the denominator as `(sqrt(v_t) / sqrt(bc2)).add_(eps)` and folds `bc1` into the learning-rate term — the Yogi-paper canonical formulation. Liger's Yogi path at `liger.py:276` builds the denominator as `sqrt(v_hat).clamp_(min=eps_yogi).add_(eps_adam)`, applying the clamp at the sqrt level (the `eps_yogi` floor) and adding a separate Adam-style additive `eps_adam` afterward. The two are algebraically equivalent up to the placement of the additive epsilon, but the clamp-then-add form makes the floor explicit. We document this here so the P2 head-to-head between standalone Yogi and Liger's Yogi route is transparent.
+
 ### 2.3 The Dispatcher
 
 The dispatch decision is pinned per parameter at its first `step()` encounter:
@@ -224,7 +226,7 @@ At step t:
 - Lion route (`ndim ≥ 2`): one buffer (`m_t`), same shape and dtype as `p`. Approximately 50% of Adam's per-parameter state.
 - Yogi route (`ndim ≤ 1`): two buffers (`m_t`, `v_t`), same shape and dtype as `p`. Same as Adam/Yogi.
 
-For a transformer block where matrix parameters outnumber vector/scalar parameters by 50-500×, the total optimizer-state footprint is approximately **55% of AdamW's** — see §4.3 for the count.
+For a transformer block where matrix parameters outnumber vector/scalar parameters by 50-500×, the total optimizer-state footprint is approximately **50% of AdamW's** — see §4.3 for the count.
 
 ---
 
@@ -241,9 +243,11 @@ In contrast, AdamW at step 1 produces:
 - `v_1 = (1-β2)·g²`, `v_hat_1 = v_1 / (1 - β2) = g²`
 - `update_1 = m_hat_1 / (sqrt(v_hat_1) + ε) = g / (|g| + ε) ≈ sign(g)`
 
-So AdamW *also* produces `sign(g)` at step 1, but only because the bias correction exactly cancels the cold-start. By step 2-5, the bias correction has not yet caught up to a meaningful `v_hat` — the effective denominator wobbles depending on the specific gradient sequence, which is why AdamW typically requires an LR warmup. Liger's Lion route does not have this transient instability: `sign(m_t)` is well-defined for all `t ≥ 1` with the same magnitude property at every step.
+So AdamW *also* produces `sign(g)` at step 1, but only because bias correction makes `E[v_hat_t] = E[g²]` at every t. Bias is corrected by construction. The remaining transient at step 2-5 is a **variance** problem, not a bias problem: `v_hat_t` is an unbiased estimator of `E[g²]` from the start, but with one to five samples its sampling variance is large, so the effective denominator wobbles depending on the specific gradient sequence. RAdam (Liu et al. 2019) names this exactly: its `r_t` rectifier is a **variance**-rectification factor — it suppresses the adaptive pipeline until the estimator has accumulated enough samples for its variance to drop to a useful range. The literature predating RAdam often described this as a "bias" issue informally; the rectifier's formal derivation is variance-based.
 
-The Yogi route on 1-D/0-D parameters does have a `v_t` accumulator and therefore a (mild) bias-correction transient, but with `β2 = 0.99` (vs. Adam's 0.999) the transient is 10× shorter, and on low-dimensional parameters the per-parameter cost of a bad early step is bounded.
+Liger's Lion route avoids the variance issue **by not using `v_t` at all**. There is no second-moment estimator to be high-variance early. `sign(m_t)` is well-defined for all `t ≥ 1` with the same magnitude property at every step — and the only momentum signal it depends on is the first moment, which converges in a single step's worth of EMA. The Lion path simply does not have the cold-start variance regime that RAdam is rectifying for.
+
+The Yogi route on 1-D/0-D parameters does still maintain a `v_t` accumulator and so does still have a cold-start variance transient. With `β2 = 0.99` (vs. Adam's 0.999) the transient is 10× shorter, and on low-dimensional parameters the per-parameter cost of a high-variance early step is bounded. Liger does not deploy a RAdam-style gate on the Yogi route because the bursty-scalar regime Yogi is targeting (§4.2) is exactly the regime where a rectifier would suppress the *correct* early updates — Yogi's bounded `v_t` rule is the right tool, not a gate on top of Adam.
 
 ### 4.2 Bounded Variance on Scalars
 
@@ -255,11 +259,20 @@ If `v_{t-1} < B²` (the burst exceeds the accumulator), the sign is negative and
 
 This is verified by `test_yogi_rank1_burst_bounded` (`test_liger.py:241-291`): after warming with `g = 1e-2` for 20 steps and injecting a burst `g = 1e3`, the accumulator change is exactly `(1-β2)·B² = 1e4`, and subsequent steps with `g = 10` shrink the accumulator by `(1-β2)·g² = 1.0` per step — visible numerical recovery.
 
-Adam in the same configuration would set `v_t ≈ (1-β2)·B² = 1e4` and decay it only exponentially: `v_t(t+k) = β2^k · 1e4`, which takes ~1000 steps to recover by an order of magnitude even with zero gradients. With non-zero gradients, recovery is *slower* (additional contributions push `v_t` back up). Yogi recovers in O(B²/g²_typical) = O(1e4 / 1) = O(1e4) steps in the worst case — same order of magnitude as Adam — but unlike Adam, Yogi recovers *strictly faster* in any sequence where `g²_typical < v_t` after the burst.
+**Recovery-rate comparison with Adam.** The two recovery rates are quantitatively different and the comparison cuts both ways depending on the post-burst gradient regime. With `β2 = 0.99` and post-burst `v_t ≈ 1e4`:
 
-### 4.3 Memory: Approximately 55% of AdamW
+- **Adam.** Recovery is multiplicative: `v_t(t+k) = β2^k · 1e4`. Recovery to `v_t = 1` (a 4-order-of-magnitude drop) takes `k = log(1e-4)/log(0.99) ≈ 916` steps with zero subsequent gradients.
+- **Yogi.** Recovery is additive in the bound: `|v_t - v_{t-1}| ≤ (1-β2)·g²_typical`. With `g²_typical = 1`, recovery to `v_t = 1` takes `k ≈ B²/g²_typical = 1e4` steps. With `g²_typical = 100`, recovery takes `k ≈ 100` steps. With `g²_typical = 1e4`, the system is in steady state.
 
-**Claim.** Liger's total optimizer-state memory is approximately 55% of AdamW's on transformer-derivative architectures.
+**In the high-burst, low-typical-gradient regime** (the regime that motivates Yogi as a *bound-against-explosion* rather than a *fast-recoverer*), Yogi recovers more slowly than Adam — about 3 orders of magnitude slower in the example above (~916 vs ~1e6 steps with `g²_typical = 1`). The argument for Yogi here is **bounded harm**, not faster recovery: a single burst cannot inflate `v_t` past the level that one bounded step of `(1-β2)·B²` can produce, while Adam's `v_t = β2·v_{t-1} + (1-β2)·B²` does the same on the up-step but then locks in the inflation until exponential decay catches up.
+
+**In the moderate-burst regime** where `g²_typical` is comparable to post-burst `v_t`, Yogi's additive recovery and Adam's multiplicative decay produce similar order-of-magnitude recovery windows, and Yogi's *bidirectional* tracking (the accumulator can shrink in response to small gradients) is a clean structural advantage over Adam's monotonic-up-then-decay envelope.
+
+The P2 benchmark (§9.2) is intentionally a high-burst regime (`B = 1e3` against typical `g ~ 1`), and the empirical result there is consistent with the math above: Liger's Yogi path produces the highest final loss of the eight optimizers tested. The Yogi-on-scalars choice is correct for the **architectural** reason (bounded variance prevents catastrophic accumulator poisoning that would shut down learning on the affected scalar entirely) but does **not** produce the lowest final-loss point on a benchmark whose gradient stream is dominated by the high-burst regime. We document this honestly in §9.2 rather than hiding behind the v_hat trajectory plot.
+
+### 4.3 Memory: Approximately 50% of AdamW
+
+**Claim.** Liger's total optimizer-state memory is approximately 50% of AdamW's on transformer-derivative architectures, measured at 50.02% on a 1B-parameter-equivalent module in §9.4.
 
 **Derivation.** Let `P_2D` = total elements in 2-D-and-higher parameters, `P_1D` = total elements in 1-D-and-0-D parameters. Then:
 
@@ -279,7 +292,7 @@ For `d = 1024`: matrix params ≈ `12·d² = 12.6M`, vector params ≈ `6·d = 6
 
 Plugging in: `Liger / AdamW ≈ (12.6M + 12K) / (2·12.6M) ≈ 0.5005`. Approximately **50.1% of AdamW** on a pure transformer.
 
-The "~55%" headline in this paper assumes a mixed architecture with a higher vector/scalar fraction (RMSNorm-heavy, multi-gate routing, etc.) where `P_1D` is materially larger. For pure transformers the ratio is closer to 50%.
+The measured value in §9.4 on the 1B-parameter-equivalent module is **50.02%**, matching the analytical prediction. Architectures with a higher vector/scalar fraction (RMSNorm-heavy, multi-gate routing) would push the ratio toward the 55-65% range, but we only headline what was actually measured.
 
 This claim is verified by P4 in the benchmark suite (§9.4).
 
@@ -336,7 +349,7 @@ Liger raises `RuntimeError` on sparse gradients. Embedding-table optimizers like
 | **Shampoo** | Kronecker eigendecomposition | AdamW fallback | None (heavy compute + memory) | 200%+ |
 | **RAMuogi** | NS5 + Yogi + RAdam gate | Yogi fallback | High (L4 + β2 + LR triple-warmup) | 100% |
 | **RACASO** | Rotated Adam + Hessian-aware | Yogi fallback | High (L4 gate + LR warmup) | 100%+ |
-| **Liger** | Lion (sign-momentum) | Yogi `v_t` | None | ~55% |
+| **Liger** | Lion (sign-momentum) | Yogi `v_t` | None | ~50% |
 
 Liger occupies a specific niche: mixed-dimensional parameters where the matrix gradients arrive well-conditioned and immediate operation matters. This is the *common* case for transformer-derivative architectures with normalization — more common than the ill-conditioned-matrix regime that motivates the heavier preconditioners.
 
@@ -407,7 +420,15 @@ We therefore use **per-family LR grids** matched to each optimizer family's typi
 
 These grids are pinned in `bench/run_bench.py::_LR_SWEEP` so the comparison is exactly reproducible from the open-source bench harness.
 
-**Reporting convention.** For each (problem, optimizer) pair, the figures and tables in §9.1–§9.10 report the **best LR for that optimizer**, averaged across seeds — the LR that minimizes the seed-averaged final loss. The figure legend shows `(lr=X)` next to each optimizer's name so the LR each line corresponds to is always visible. This is the same convention used in the Lion, Sophia, Adafactor, and Muon papers.
+**Reporting convention.**
+
+- *Best LR per optimizer, averaged across seeds.* For each (problem, optimizer) pair the figures and tables in §9.1–§9.10 report the **best LR for that optimizer**, averaged across seeds — the LR that minimizes the seed-averaged final loss. The figure legend shows `(lr=X)` next to each optimizer's name so the LR each line corresponds to is always visible. This is the same convention used in the Lion, Sophia, Adafactor, and Muon papers.
+
+- *Smoothed final loss (mean of the last 50 steps).* `final_loss` is the **mean of the last 50 steps** of the per-step loss trajectory when the trajectory is long enough; for shorter trajectories it falls through to the last step. A single trailing noisy minibatch is a high-variance estimator of true final-loss, and an earlier version of this paper reported the unsmoothed last-step value — which privileged optimizers whose last step happened to land on an easy batch. The 50-step window is short enough to track late-trajectory descent and long enough to average out one batch's worth of luck. The unsmoothed last-step CSV is preserved at `bench/results_unsmoothed.csv` for reproducibility.
+
+- *Fixed-budget on real tasks.* R1/R2/R3 auto-enable fixed-budget execution: `bench/run_bench.py` records the first-convergence step but does not break out of the loop, so every optimizer runs the full `max_steps`. Earlier early-stop behavior produced a methodologically unfair head-to-head — different optimizers' final-loss numbers were reported at different points along their trajectories. The `--fixed-budget` CLI flag exposes the same behavior on synthetic problems for any user who wants identical apples-to-apples runs.
+
+- *Truncate-to-min across seeds.* When aggregating multi-seed trajectories into a single curve for a figure, we truncate to the shortest seed's length rather than padding to the longest. Padding-with-final-value implicitly claims that all seeds were observed at every step, which they were not. This policy is applied uniformly across `bench/plot_bench.py` and `bench/plot_cross_comparison.py`; see `bench/README.md` for the unified statement.
 
 **Seed budgets.** Synthetic problems P1–P5 use seeds {0, 1, 2} (three independent runs per (problem, optimizer, LR) cell). Real-task problems R1/R2/R3 use seeds {0, 1} (two independent runs per cell, because each run is much more expensive in GPU-time — a single R1 ResNet-18 training is ~6 minutes, a single R3 NanoGPT training is ~1 minute, but the 8-optimizer × 4-LR cardinality multiplies fast).
 
@@ -421,24 +442,51 @@ These grids are pinned in `bench/run_bench.py::_LR_SWEEP` so the comparison is e
 
 **Metric.** Steps to reach `loss < converged_tol`. Lower is better.
 
-| Optimizer | Best LR | Steps to converge | Final loss | μs/step |
-|---|---|---|---|---|
-| Adam    | 3e-3 | 139  | 9.89e-3 | 1341 |
-| AdamW   | 3e-3 | 140  | 9.82e-3 | 1334 |
-| Yogi    | 3e-3 | 190  | 9.89e-3 | 1658 |
-| Lion    | 3e-4 | 865  | 9.96e-3 | 1221 |
-| **Liger** | 3e-4 | 818 | 9.97e-3 | 1584 |
-| Muogi   | 1e-3 | 479  | 9.97e-3 | 1667 |
-| RAMuogi | 1e-3 | 1089 | 9.98e-3 | 1554 |
-| RACASO  | 1e-3 | — (diverged) | 1.44 | 1742 |
+| Optimizer | Best LR | First-converge step | Final loss |
+|---|---|---|---|
+| Adam    | 3e-3 | 139  | 9.89e-3 |
+| AdamW   | 3e-3 | 140  | 9.82e-3 |
+| Yogi    | 3e-3 | 190  | 9.89e-3 |
+| Lion    | 3e-4 | 865  | 9.96e-3 |
+| **Liger** | 3e-4 | 818 | 9.97e-3 |
+| Muogi   | 1e-3 | 479  | 9.97e-3 |
+| RAMuogi | 1e-3 | 1089 | 9.98e-3 |
+| RACASO  | 1e-3 | — (diverged) | 1.44 |
 
-All 7 of {Adam, AdamW, Yogi, Lion, Liger, Muogi, RAMuogi} converge to the `1e-2` tolerance; RACASO diverges on this LR sweep at the chosen problem size. AdamW reaches converged_tol fastest (140 steps); Liger and Lion take ~6× longer because the sign-update only moves by ±lr per coordinate, so reaching a small final loss requires more steps. Liger and Lion are tied within noise (818 vs 865 steps); the dispatch overhead is not visible at this scale. The headline observation for P1: **all four "Lion-family" optimizers (Lion, Liger, Muogi, RAMuogi) hit converged_tol at this lr; the absolute speed-to-tolerance ranking is dominated by the per-element-vs-sign-update tradeoff, not by dispatch.**
+All 7 of {Adam, AdamW, Yogi, Lion, Liger, Muogi, RAMuogi} converge to the `1e-2` tolerance; RACASO diverges on this LR sweep at the chosen problem size. AdamW reaches converged_tol fastest (140 steps); Liger and Lion take ~6× longer because the sign-update only moves by ±lr per coordinate, so reaching a small final loss requires more steps. Liger and Lion are tied within noise (818 vs 865 steps); the dispatch overhead is not visible at this scale.
+
+**Lion configuration note.** The Lion baseline above used the published two-coefficient `betas=(0.9, 0.99)`. This revision of the paper pins the Lion baseline at `betas=(0.9, 0.9)` to match Liger's one-coefficient simplification (§2.1), so the Lion-vs-Liger comparison is on the same Lion variant. A re-run of P1 with the corrected Lion baseline is part of the "GPU work pending" list at the end of §9; we expect the Lion-vs-Liger gap to close further under the corrected config.
+
+The headline observation for P1: **all four "Lion-family" optimizers (Lion, Liger, Muogi, RAMuogi) hit converged_tol at this lr; the absolute speed-to-tolerance ranking is dominated by the per-element-vs-sign-update tradeoff, not by dispatch.**
 
 ### 9.2 P2 — Scalar Burst
 
-**Setup.** Scalar gate alone. Gradient stream: small (`~1.0`) with periodic bursts (`~1e3` every 50 steps). Measures Yogi-path burst recovery.
+**Setup.** Scalar gate alone. Gradient stream: small (`~1.0`) with periodic bursts (`~1e3` every 50 steps). Measures Yogi-path burst recovery and final-loss behavior on a scalar-only problem.
 
-**Metric.** `v_hat` trajectory plot. Liger's Yogi path should show post-burst recovery; AdamW should show persistent inflation.
+**Metric.** Two things, in two panels: (a) Liger's `last_max_v_hat` per LR — the post-burst residual that motivates Yogi's bounded `v_t` rule — and (b) the best-LR loss trajectory for every optimizer in the sweep so the reader can see comparative final loss directly.
+
+**Best-LR final loss across all 8 optimizers (lower = better):**
+
+| Optimizer | Best LR | Final loss |
+|---|---|---|
+| Adam    | 3e-3 | **0.965** |
+| AdamW   | 3e-3 | 0.967 |
+| Yogi    | 3e-3 | 0.969 |
+| Lion    | 3e-4 | 1.821 |
+| Muogi   | 1e-3 | 1.920 |
+| RACASO  | 1e-3 | 1.987 |
+| RAMuogi | 1e-3 | 2.159 |
+| **Liger** | 3e-4 | **2.167** |
+
+**Honest reading: Liger has the *worst* final loss of the 8 optimizers tested on P2.** The cause is a per-family-LR-grid artifact rather than a structural failure of the Yogi path. Standalone Yogi runs on the Adam-family LR grid `[1e-4, 3e-4, 1e-3, 3e-3]` and finds its best LR at `3e-3`. Liger runs on the Lion-family LR grid `[1e-5, 3e-5, 1e-4, 3e-4]` because Liger's matrix-route is Lion (§9.0 methodology); but on a P2 problem with *no* matrix parameters — the entire model is the scalar gate — the LR grid Liger inherits from its Lion-family classification is an order of magnitude lower than the LR a standalone Yogi would pick. Liger's Yogi path is therefore underpowered on a scalar-only problem by construction.
+
+This is a real limitation, not a benchmarking quirk to be hand-waved past. Liger commits to a single per-instance LR for both routes. On any model whose parameter mix is dominated by scalars/1-D params, the user must either run a separate optimizer group with a Yogi-family LR (the per-parameter-group composition pattern §1.5 describes), or accept that the Yogi path's effective LR is constrained by what the Lion-path matrix parameters need. P2 is the surgical worst case for this trade: zero matrix parameters, so the Lion path's LR cap does no work but still constrains the Yogi path.
+
+**What the v_hat panel does show.** Liger's `last_max_v_hat` settles at `~1e5` across all four LRs in the grid — the expected `B²·(1-β2)/bc2 ≈ 1e4 / (1-0.99^N)` for any post-burst step within the recorded window. The bounded-variance property §4.2 proves holds in vivo; the bound is the right shape; the recovery rate in the high-burst regime is slow (§4.2 spells out why). Adam-family optimizers would set `v_t ≈ (1-β2)·B² = 1e4` and decay multiplicatively, which on the same gradient stream produces lower final loss because the LR is operating in its appropriate regime.
+
+**What §9.2 says structurally.** Yogi-on-scalars is the right tool when the *failure mode you care about* is catastrophic accumulator poisoning (a single 1e3 burst locking the optimizer into a sub-LR regime for thousands of steps under Adam's exponential decay). Yogi-on-scalars is *not* the right tool when the failure mode you care about is fastest-recovery-from-burst-into-low-final-loss on a scalar-only problem. Liger's commitment is to the first failure mode — it composes within an architecture whose matrix parameters dominate and whose scalars need bounded-harm semantics. The P2 result is the price of that commitment, named honestly.
+
+(See `bench/figs/fig2_p2_v_hat_trajectories.png` for the v_hat residual scatter and the comparative loss trajectory.)
 
 ### 9.3 P3 — Warmup-Free
 
@@ -492,23 +540,7 @@ This problem also runs locally as a CPU smoke test (no GPU required), and is the
 
 ### 9.6 In-Production Trace on an Internal Architecture
 
-Liger is in active production use as the assigned optimizer for one parameter group in a transformer-derivative architecture training internally to our group. The group is a mixed-dimensional routing layer: 20 matrix-shaped parameters (Lion route) + 29 vector- or scalar-shaped parameters (Yogi route), totaling 0.99M parameters out of a 22.7M-parameter model. It is exactly the niche §6 of this paper names: mixed dimensionality, well-conditioned matrix gradients (downstream of normalized aggregation), and a system-wide preference for warmup-free operation (the host training loop applies an LR warmup at the controller level, and per-group optimizers must not compound it).
-
-The host emits Liger's `get_telemetry()` dict at every logged step. The first 80 steps from a recent run are extracted in `bench/morpheus_v2.2_liger_telemetry.csv` (17 telemetry/loss pairs) and rendered in `bench/morpheus_v2.2_liger_trajectory.png`; the file naming reflects the internal version that produced the trace. The trace validates the analytical claims directly on a real training run rather than a synthetic benchmark. The data is third-party-unverifiable (the host architecture is not open-sourced) but documents the in-production behavior the paper claims; the reproducible head-to-head against published baselines lives in §9.1–§9.5 and §9.7–§9.10.
-
-**Router census (P5 in production).** `n_2d = 20` and `n_1d = 29` are stable across every step — the dispatch matches the ground-truth ndim count at construction and never drifts. The router-correctness claim from §9.5 holds in vivo.
-
-**Lion-path momentum integration (warmup-free, §4.1 / §9.3).** The maximum Lion-route `||m_t||₂` follows the expected EMA integration profile: `9e-4` at step 1, `1.7e-3` at step 2, ..., `5.3e-3` at step 10, plateauing at `~8e-3` by step 30 and stable through step 80. The integration constant matches `β1 = 0.9` to within float precision (the saturation point is `||g||·(1-β1)·Σβ1^k = ||g||`, reached at the expected timescale of `1/(1-β1) = 10` steps). At step 1 with `m_0 ≈ 0` the optimizer is already producing meaningful sign-momentum updates — no warmup gate, no cold-start throttle.
-
-**Lion-path saturation (`upd_l1`).** `Σ|sign(m_t)|` is constant at `1.5e+05` across every step, equal to the element count of the largest Lion-route parameter. This means every coordinate of `m_t` is non-zero at every step — sign is fully saturated, the bounded-direction property holds with no degenerate zero-momentum coordinates.
-
-**Yogi-path accumulator behavior (§4.2 in vivo).** `v_max` is stable in the range `3.3e-3` to `3.8e-3` across all 80 steps — the matrix-route gradients arrive well-conditioned at typical magnitude `O(0.05–0.08)` and Yogi's accumulator equilibrates to `~g²_typical ≈ 4e-3`. `v_min` decays from `1.0e-3` at step 1 to `1.3e-5` at step 80 as the accumulator catches up to lower-variance scalar parameters. The bias-corrected `v_hat` values pass through the `eps_yogi = 1e-3` floor in the denominator without producing pathological updates.
-
-**Loss trajectory.** Mean loss decreases monotonically from `5.74` at step 1 to `5.39` at step 80 (a 6.1% reduction in 80 steps for a 22.7M-param model with `lr_base = 3e-5 → 3e-7` schedule). The trajectory is monotonic with no divergent steps and no rebounds — the optimizer is doing useful work from step 1.
-
-**What this trace does and does not show.** Liger is one of several optimizers assigned across this architecture's parameter groups; each group is routed to the optimizer matched to its gradient regime, in the per-parameter-group composition pattern §1.5 describes. The trace demonstrates that Liger runs stably as the chosen tool on the group its design targets, and validates the analytical §4 claims (warmup-independence, bounded variance, router census) directly on a real training run. It does not substitute for the controlled head-to-head comparison in §9.1-§9.5 and §9.7-§9.10; both kinds of evidence appear in this paper for distinct purposes.
-
-The trace also illustrates the diagnostic interface from §7 working as designed: a single one-line telemetry print at each logged step gives a complete picture of dispatch census, Lion-path health, and Yogi-path health — small enough to embed in an existing training log without bloating the output, and self-explanatory enough that a reader can verify the §4.1 claim from the trace alone.
+Liger is in active production use as the assigned optimizer for one parameter group in a transformer-derivative architecture training internally to our group. Because this trace is third-party-unverifiable (the host architecture is not open-sourced), the full per-step telemetry analysis has been moved to **Appendix A — In-Production Trace**. The reproducible head-to-head against published baselines lives in §9.1–§9.5 and §9.7–§9.10.
 
 ### 9.7 R1 — CIFAR-10 ResNet-18
 
@@ -516,20 +548,20 @@ The trace also illustrates the diagnostic interface from §7 working as designed
 
 **Why this problem.** This is the canonical "does this optimizer work on a real model" gate in every optimizer paper since Adam. A new optimizer that fails on CIFAR-10 ResNet-18 is not publishable; conversely, an optimizer that converges here cannot be dismissed as toy-data-only.
 
-**Results.**
+**Results** (smoothed final loss = mean over the last 50 steps; convergence_step = first step where loss < 0.5, recorded but no longer used for early-stop):
 
-| Optimizer | Best LR | Final train loss | Steps to converge | μs/step |
-|---|---|---|---|---|
-| Adam    | 1e-3 | 0.463 | 1032 | 64,812 |
-| RAMuogi | 3e-4 | 0.475 | 1236 | 69,751 |
-| Muogi   | 3e-4 | 0.480 |  880 | 69,466 |
-| AdamW   | 1e-3 | 0.482 | 1176 | 62,457 |
-| Lion    | 3e-4 | 0.482 |  782 | 64,662 |
-| **Liger** | 3e-4 | 0.485 | 1062 | 72,511 |
-| RACASO  | 3e-4 | 0.485 | 1018 | 71,893 |
-| Yogi    | 1e-3 | 0.488 |  834 | 67,674 |
+| Optimizer | Best LR | Final train loss (smoothed) | First-convergence step |
+|---|---|---|---|
+| AdamW   | 1e-3 | **0.696** | 1151 |
+| Yogi    | 1e-3 | 0.697 | 822 |
+| Muogi   | 3e-4 | 0.702 | 830 |
+| RAMuogi | 3e-4 | 0.704 | 1212 |
+| RACASO  | 3e-4 | 0.709 | 885 |
+| **Liger** | 3e-4 | 0.713 | 912 |
+| Lion    | 3e-4 | 0.716 | 736 |
+| Adam    | 1e-3 | 0.739 | 912 |
 
-**Reading the result.** All 8 optimizers cluster within a 5% relative band on final train loss (0.463 to 0.488 over 5000 steps). The ordering is dominated by ResNet-18-specific factors (LR schedule, weight initialization, BatchNorm interaction) rather than the dispatch decision Liger encodes. **Liger is competitive but not winning on R1**: this is honest — CIFAR-10 ResNet-18 with constant LR is a setting where the sign-momentum-vs-adaptive-scaling tradeoff is roughly neutral, and the matrix gradients in a small CNN do not have the "ill-conditioned cross-branch coupling" regime that would penalize Liger's no-preconditioning matrix path. The R1 result tells the reader Liger **trains a real model without falling over**; the R2 and R3 results tell the reader where Liger's dispatch decision pays off.
+**Reading the result.** All 8 optimizers cluster within a ~6% relative band on smoothed final train loss (0.696 to 0.739 over 5000 steps under early-stop budget; a fixed-budget GPU re-run is pending — see "GPU work pending" below). The ordering is dominated by ResNet-18-specific factors (LR schedule, weight initialization, BatchNorm interaction) rather than the dispatch decision Liger encodes. **Liger is competitive but not winning on R1**: this is honest — CIFAR-10 ResNet-18 with constant LR is a setting where the sign-momentum-vs-adaptive-scaling tradeoff is roughly neutral, and the matrix gradients in a small CNN do not have the "ill-conditioned cross-branch coupling" regime that would penalize Liger's no-preconditioning matrix path. The R1 result tells the reader Liger **trains a real model without falling over**.
 
 (See `bench/figs/fig6_r1_cifar10.png` for full loss curves.)
 
@@ -539,20 +571,22 @@ The trace also illustrates the diagnostic interface from §7 working as designed
 
 **Why this problem.** Karpathy-canonical lightweight LM gate. Every LM optimizer claim has tiny-shakespeare somewhere as the "does it train language at all" sanity check.
 
-**Results.**
+**Results** (smoothed final loss = mean over the last 50 steps; first-convergence step recorded but no longer used for early-stop on real tasks):
 
-| Optimizer | Best LR | Final train loss | Steps to converge |
+| Optimizer | Best LR | Final train loss (smoothed) | First-convergence step |
 |---|---|---|---|
-| **Liger** | 3e-4 | **1.484** | 2203 |
-| Adam    | 1e-3 | 1.581 | 2905 |
-| AdamW   | 1e-3 | 1.582 | 2905 |
-| Yogi    | 1e-3 | 2.088 | — (did not reach 1.5) |
-| Muogi   | 3e-4 | 2.279 | — |
-| RAMuogi | 3e-4 | 2.453 | — |
-| Lion    | 3e-4 | 2.500 | — |
-| RACASO  | 3e-4 | 3.806 | — |
+| **Liger** | 3e-4 | **1.586** | 2109 |
+| AdamW   | 1e-3 | 1.592 | 2905 |
+| Adam    | 1e-3 | 1.595 | 2905 |
+| Yogi    | 1e-3 | 2.055 | — (did not reach 1.5) |
+| Muogi   | 3e-4 | 2.271 | — |
+| RAMuogi | 3e-4 | 2.462 | — |
+| Lion    | 3e-4 | 2.510 | — |
+| RACASO  | 3e-4 | 3.899 | — |
 
-**This is the headline real-task result for the dispatch claim.** A mixed-dim transformer model (4-layer char-LM with attention projections, FFN matrices, RMSNorm gains, and biases) is exactly the architecture class §1.3 names as Liger's target. **Liger reaches the lowest final train loss (1.484) and the only one to hit converged_tol within budget**, ~700 steps earlier than Adam/AdamW. Lion alone sits at 2.500 — the sign-update is fine on the matrix parameters but produces no useful adaptation for the bias and norm-gain parameters, which is the bursty-scalar regime Yogi's variance-rectified path solves. Liger's dispatch (Lion on matrices + Yogi on 1-D/0-D params) covers both regimes from one optimizer instance.
+**Reading R2 honestly.** A mixed-dim transformer model (4-layer char-LM with attention projections, FFN matrices, RMSNorm gains, and biases) is exactly the architecture class §1.3 names as Liger's target. Under the smoothed-final-loss convention, **Liger, AdamW, and Adam form a three-way tie at the top within ~0.6% relative**: Liger at 1.586, AdamW at 1.592, Adam at 1.595. The earlier version of this paper reported a 1.484 vs 1.581 gap that put Liger 6% ahead; that gap was a single-noisy-minibatch reporting artifact, not a real difference. Smoothing the last 50 steps across both seeds collapses the gap.
+
+What Liger does demonstrate on R2 is **competitiveness with the strongest baseline at half the optimizer-state memory**: Liger lands at AdamW's final loss while carrying one buffer per matrix parameter instead of two. Lion alone sits at 2.510 — the sign-update is fine on the matrix parameters but produces no useful adaptation for the bias and norm-gain parameters, which is the bursty-scalar regime Yogi's variance-rectified path is designed for. The dispatch decision (Lion on matrices + Yogi on 1-D/0-D params) is what closes the gap from Lion's 2.510 to Liger's 1.586. The headline R2 claim is **memory-efficient parity with AdamW**, not a clean win over it.
 
 (See `bench/figs/fig7_r2_charlm.png` for full loss curves.)
 
@@ -564,18 +598,22 @@ The trace also illustrates the diagnostic interface from §7 working as designed
 
 **Results.**
 
-| Optimizer | Best LR | Final train loss | Steps to converge |
-|---|---|---|---|
-| **Liger** | 3e-4 | **4.620** |  94 |
-| Yogi    | 1e-3 | 4.844 |  40 |
-| AdamW   | 1e-3 | 4.876 |  42 |
-| RAMuogi | 3e-4 | 4.881 | 217 |
-| Lion    | 3e-4 | 4.883 |  38 |
-| Adam    | 1e-3 | 4.903 |  42 |
-| Muogi   | 3e-4 | 4.965 |  60 |
-| RACASO  | 3e-4 | 50.54 | — (diverged on DivBackward0; see RACASO paper §6) |
+| Optimizer | Best LR | Final train loss (smoothed) | First-convergence step | Trajectory length |
+|---|---|---|---|---|
+| RAMuogi | 3e-4 | **6.24** | 216 | 216-218 |
+| **Liger** | 3e-4 | 7.20 |  90 |  90-97 |
+| Muogi   | 3e-4 | 10.43 |  58 |  58-62 |
+| Yogi    | 1e-3 | 23.81 |  38 |  38-43 |
+| AdamW   | 1e-3 | 26.42 |  40 |  40-45 |
+| Adam    | 1e-3 | 26.44 |  40 |  40-45 |
+| Lion    | 3e-4 | 31.57 |  36 |  36-40 |
+| RACASO  | 3e-4 | 52.24 | — (diverged on DivBackward0; see RACASO paper §6) | 1000 |
 
-**Second-best real-task result for the dispatch claim.** At NanoGPT scale (~30M params), Liger reaches the lowest final train loss again (4.620 vs 4.844 for Yogi, 4.876 for AdamW). The convergence-step column shows the inverse correlation: optimizers that converge fastest (Lion at 38 steps, Adam at 42 steps) stop early at higher loss; Liger trains 94 steps and reaches the lowest loss. **RACASO diverges to 50.54** — this is the L5 DivBackward0 hazard documented in §6 and §7 of the RACASO paper, triggered by the byte-level NanoGPT model's softmax-norm path producing unbounded second derivatives. Liger's no-preconditioning matrix path and burst-safe scalar path together avoid this failure class structurally.
+**Reading R3 honestly under smoothed-final-loss-with-early-stop.** The trajectory-length column matters here. Under the earlier early-stop behavior, every R3 run stopped at the first step where `loss < 5.0` and reported the noisy last-step value. Under smoothed-final-loss-over-last-50 applied to those *same trajectories* (no GPU re-run), the table above is what falls out. **Liger is no longer the best on R3 — RAMuogi is.** The ordering is also dominated by trajectory-length artifact: optimizers that early-stopped at 40 steps have their entire trajectory (including the ~200-loss initial steps) folded into the smoothed mean, while RAMuogi's longer 216-step trajectory has more low-loss steps in its last-50 window. The earlier 4.620 headline for Liger was a single-noisy-minibatch artifact compounded by the early-stop break.
+
+**The right comparison is a fixed-budget re-run with all optimizers running the full 1000 steps**, which is currently pending leased GPU time — see "GPU work pending" at the end of this section. We expect the smoothed-final-loss-over-last-50 numbers from a fixed-budget run to compress the spread substantially and to remove the trajectory-length confound. The honest claim from the data we have today: **Liger is no longer the headline R3 winner**, and the earlier 4.62-vs-4.88 ranking was an artifact of the early-stop + last-step-final reporting that the methodology fixes in this revision address.
+
+What R3 still shows: **RACASO diverges to ~52** on byte-level NanoGPT — the L5 DivBackward0 hazard documented in §6 and §7 of the RACASO paper, triggered by the byte-level NanoGPT model's softmax-norm path producing unbounded second derivatives. Liger's no-preconditioning matrix path and burst-safe scalar path together avoid this failure class structurally, which is the structural claim §1.5 names and the R3 result still supports.
 
 (See `bench/figs/fig8_r3_nanogpt.png` for full loss curves.)
 
@@ -597,20 +635,40 @@ The Liger benchmark suite runs against **all three sibling-family optimizers** d
 
 **Cross-comparison figure.** See `bench/figs/cross_comparison.png` — a single multi-panel figure overlaying all 8 optimizers (the 5 baselines + the 3 siblings) on R1/R2/R3. The same figure appears in `Muogi/RAMuogi_Paper.md` §9 and `RACASO/RACASO_Paper.md` §9 so a reviewer reading any one paper sees the unified head-to-head.
 
-**Unified head-to-head table** (same content across all 3 papers; this paper highlights Liger):
+**Unified head-to-head table** (smoothed final loss, mean over the last 50 steps; this paper highlights Liger):
 
 | Optimizer | R1 CIFAR-10 | R2 char-LM | R3 NanoGPT | State (% AdamW) |
 |---|---|---|---|---|
-| Adam    | 0.463 | 1.581 | 4.903 | 100.00% |
-| AdamW   | 0.482 | 1.582 | 4.876 | 100.00% |
-| Yogi    | 0.488 | 2.088 | 4.844 | 100.00% |
-| Lion    | 0.482 | 2.500 | 4.883 | 50.00%  |
-| **Liger** | **0.485** | **1.484** ✦ | **4.620** ✦ | **50.02%** ✦ |
-| Muogi   | 0.480 | 2.279 | 4.965 | 100.00% |
-| RAMuogi | 0.475 | 2.453 | 4.881 | 100.00% |
-| RACASO  | 0.485 | 3.806 | 50.54 (diverged) | n/a (OOM at 1B) |
+| Adam    | 0.739 | 1.595 | 26.44 | 100.00% |
+| AdamW   | 0.696 | 1.592 | 26.42 | 100.00% |
+| Yogi    | 0.697 | 2.055 | 23.81 | 100.00% |
+| Lion    | 0.716 | 2.510 | 31.57 | 50.00%  |
+| **Liger** | 0.713 | **1.586** | 7.20 | **50.02%** ✦ |
+| Muogi   | 0.702 | 2.271 | 10.43 | 100.00% |
+| RAMuogi | 0.704 | 2.462 | **6.24** | 100.00% |
+| RACASO  | 0.709 | 3.899 | 52.24 (diverged) | n/a (OOM at 1B) |
 
-(✦ = Liger wins this column. Lower is better for loss columns; lower is better for state.)
+(✦ = Liger has the lowest state-bytes value. **Bold** marks the column leader. Lower is better for loss columns; lower is better for state.)
+
+Caveats on the numbers above:
+
+- The R3 column is heavily affected by **trajectory-length artifact under early-stop**: shorter-trajectory optimizers (Adam, AdamW, Lion at 36-45 steps) have their entire pre-convergence noise window folded into the smoothed mean, while longer-trajectory optimizers (RAMuogi at 216 steps, Liger at ~94 steps) have more low-loss steps in their last-50 window. The R3 numbers as a whole are not directly comparable until a fixed-budget GPU re-run lands; see "GPU work pending" below.
+- R1 and R2 had longer trajectories under early-stop (~1000-3000 steps), so the smoothed numbers there are closer to a fair head-to-head, though a fixed-budget re-run will still produce cleaner numbers.
+- The **memory-and-state column is fully verified at 50.02% from the 1B-equivalent measurement in §9.4**; that result is independent of the early-stop methodology fixes and remains the cleanest headline for the paper.
+
+**The honest contribution that survives this revision:** (a) dispatch-by-ndim is principled and the §4.1/§4.2 derivations hold; (b) Liger's optimizer state is 50.02% of AdamW's, measured at 1B-equivalent parameter scale; (c) the exact router places every parameter on the correct route at construction. The earlier-reported R2 and R3 single-noisy-minibatch wins were artifacts; the corrected R2 is a memory-efficient tie with AdamW at top; the corrected R3 awaits a fixed-budget re-run.
+
+**GPU work pending.** The following re-runs are blocked on leased GPU time and will land when GPU is available:
+
+1. *R1/R2/R3 fixed-budget re-sweep.* Run every (problem × optimizer × LR × seed) cell to the full `max_steps` with no early-stop, and recompute the smoothed-final-loss head-to-head on the resulting trajectories. The expected outcome is that the R3 trajectory-length confound disappears, and the relative ordering on R3 stabilizes. CLI:
+
+   ```bash
+   python bench/run_bench.py --sweep --device cuda --output bench/results.csv
+   ```
+
+   (The harness auto-applies fixed-budget for R1/R2/R3; no flag needed.)
+
+2. *P1 re-sweep with corrected Lion baseline.* The Lion baseline configuration was changed from the published two-coefficient `betas=(0.9, 0.99)` to the one-coefficient `betas=(0.9, 0.9)` so the Lion vs Liger head-to-head reflects the same Lion variant Liger uses internally. P1 rows for Lion need to be re-run; same CLI as above will pick the corrected wrapper.
 
 ---
 
@@ -653,6 +711,26 @@ The reference implementation is `liger.py` — single file, single class, PyTorc
 ## Acknowledgments
 
 Thanks to **Ben Goertzel** for the standing ArXiv endorsement that makes work in this lineage publishable on first submission. Thanks to **Chen et al.** (Lion) and **Zaheer et al.** (Yogi) for the algorithms Liger composes — their work does the actual mathematical lifting; Liger is a structural decision *about* their work. Thanks to the **MetaFore** group for the surrounding research stack (RACASO, Muogi, RAMuogi) that establishes the publishable-optimizer-family pattern this paper follows.
+
+---
+
+## Appendix A — In-Production Trace
+
+Liger is in active production use as the assigned optimizer for one parameter group in a transformer-derivative architecture training internally to our group. The group is a mixed-dimensional routing layer: 20 matrix-shaped parameters (Lion route) + 29 vector- or scalar-shaped parameters (Yogi route), totaling 0.99M parameters out of a 22.7M-parameter model. It is exactly the niche §6 of this paper names: mixed dimensionality, well-conditioned matrix gradients (downstream of normalized aggregation), and a system-wide preference for warmup-free operation (the host training loop applies an LR warmup at the controller level, and per-group optimizers must not compound it).
+
+The host emits Liger's `get_telemetry()` dict at every logged step. The first 80 steps from a recent run are extracted in `bench/morpheus_v2.2_liger_telemetry.csv` (17 telemetry/loss pairs) and rendered in `bench/morpheus_v2.2_liger_trajectory.png`; the file naming reflects the internal version that produced the trace. **The data is third-party-unverifiable** (the host architecture is not open-sourced) — that is the reason it lives in an appendix rather than in §9's main results.
+
+**Router census (P5 in production).** `n_2d = 20` and `n_1d = 29` are stable across every step — the dispatch matches the ground-truth ndim count at construction and never drifts. The router-correctness claim from §9.5 holds in vivo.
+
+**Lion-path momentum integration (warmup-free, §4.1 / §9.3).** The maximum Lion-route `||m_t||₂` follows the expected EMA integration profile: `9e-4` at step 1, `1.7e-3` at step 2, ..., `5.3e-3` at step 10, plateauing at `~8e-3` by step 30 and stable through step 80. The integration constant matches `β1 = 0.9` to within float precision. At step 1 with `m_0 ≈ 0` the optimizer is already producing meaningful sign-momentum updates — no warmup gate, no cold-start throttle.
+
+**Lion-path saturation (`upd_l1`).** `Σ|sign(m_t)|` is constant at `1.5e+05` across every step, equal to the element count of the largest Lion-route parameter. This means every coordinate of `m_t` is non-zero at every step — sign is fully saturated, the bounded-direction property holds with no degenerate zero-momentum coordinates.
+
+**Yogi-path accumulator behavior (§4.2 in vivo).** `v_max` is stable in the range `3.3e-3` to `3.8e-3` across all 80 steps — the matrix-route gradients arrive well-conditioned at typical magnitude `O(0.05–0.08)` and Yogi's accumulator equilibrates to `~g²_typical ≈ 4e-3`. `v_min` decays from `1.0e-3` at step 1 to `1.3e-5` at step 80 as the accumulator catches up to lower-variance scalar parameters.
+
+**Loss trajectory.** Mean loss decreases monotonically from `5.74` at step 1 to `5.39` at step 80 (a 6.1% reduction in 80 steps for a 22.7M-param model with `lr_base = 3e-5 → 3e-7` schedule). The trajectory is monotonic with no divergent steps and no rebounds.
+
+**What this trace does and does not show.** It demonstrates that Liger runs stably as the chosen tool on the group its design targets, and validates the analytical §4 claims (warmup-independence, bounded variance, router census) directly on a real training run. It does not substitute for the controlled head-to-head comparison in §9.1-§9.5 and §9.7-§9.10; both kinds of evidence appear in this paper for distinct purposes.
 
 ---
 

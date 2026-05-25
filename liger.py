@@ -139,8 +139,6 @@ class Liger(Optimizer):
             buffers. Default 1e-6 (matches Yogi/Muogi/RACASO family).
     """
 
-    _optimizer_handles_own_clip: bool = False
-
     def __init__(
         self,
         params,

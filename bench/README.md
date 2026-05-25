@@ -89,7 +89,7 @@ Each problem isolates one analytical claim from `Liger_Paper.md` §4 / §9. The 
 
 **File:** `problems/p4_memory_scaling.py`
 
-**Claim:** Liger's optimizer state is approximately 55% of AdamW's on transformer-derivative architectures.
+**Claim:** Liger's optimizer state is approximately 50% of AdamW's on transformer-derivative architectures (measured at 50.02% in P4).
 
 **Setup:** Synthetic 1B-parameter-equivalent module (tiled, doesn't actually run forward at scale — just instantiates optimizer state). Measure `sum(tensor.numel() · tensor.element_size())` across all buffers.
 
@@ -124,7 +124,7 @@ This problem is **CPU-runnable locally** — it only allocates state, doesn't ru
 | `muogi` | imported from sibling `Muogi/muogi.py` | 100% | β2 |
 | `ramuogi` | imported from sibling `Muogi/ramuogi.py` | 100% | β2 + L4 + LR |
 | `racaso` | imported from sibling `RACASO/racaso.py` | 100%+ | β2 + L4 + LR |
-| `liger` | imported from parent `liger.py` | ~55% | **none on Lion route** |
+| `liger` | imported from parent `liger.py` | ~50% | **none on Lion route** |
 
 Hyperparameters are pinned per the canonical config block in `optimizers/README.md`. Only `lr` and `seed` vary in the sweep matrix.
 
@@ -147,6 +147,39 @@ Single run:
 ```bash
 python run_bench.py --problem p1 --optimizer liger --lr 1e-4 --seed 0
 ```
+
+## Reporting convention
+
+**Smoothed final-loss.** `final_loss` in `results.csv` is the **mean of
+the last 50 steps** of the per-step loss trajectory when the trajectory
+is long enough; otherwise it falls through to the last step. A single
+trailing minibatch loss is a noisy estimator of final-loss for any
+stochastic problem; the 50-step window smooths through one batch's worth
+of luck without biasing any one optimizer. The unsmoothed (last-step)
+version of every row is preserved at `bench/results_unsmoothed.csv` for
+reproducibility.
+
+**Fixed-budget on real tasks.** R1/R2/R3 problems auto-enable
+fixed-budget execution: the harness records the first-convergence step
+into `convergence_step` but does **not** break out of the loop, so every
+optimizer runs to the problem's `max_steps`. Early-stop is unfair across
+optimizers because different optimizers hit a given tolerance at
+different steps, so their final-loss numbers would be reported at
+different points along their trajectories. The `--fixed-budget` CLI
+flag exposes the same behavior for synthetic problems on request.
+
+**Cross-seed aggregation.** Both `plot_bench.py` and
+`plot_cross_comparison.py` truncate to the **shortest seed's length** —
+padding-with-final-value implicitly claims observations were made at
+steps that were never run. Honest aggregation is truncate-to-min.
+
+## Environment
+
+This bench was developed and verified locally on PyTorch **2.10.0**
+(CPU). GPU sweeps were run on PyTorch 2.x with CUDA. The CPU-only fixes
+(CSV smoothing, plot aggregation) do not depend on a specific PyTorch
+version; GPU re-runs should pin the same major version as the original
+sweep for byte-exact reproducibility.
 
 ## CSV schema
 

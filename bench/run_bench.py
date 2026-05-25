@@ -90,6 +90,29 @@ def _build_problem(name: str, seed: int, device: str = "cpu") -> BenchProblem:
     return _PROBLEMS[name](seed, device=device)
 
 
+_SMOOTH_WINDOW = 50
+
+
+def _smoothed_final_loss(trajectory: List[float]) -> float:
+    """Report the mean of the last ``_SMOOTH_WINDOW`` steps when the
+    trajectory is long enough; otherwise fall through to the last step.
+
+    NaN-coded steps (recorded as -1.0 by the harness) are excluded from
+    the mean so a single NaN late in the run does not pull the smoothed
+    value to -1. If every step in the window is NaN-coded, return NaN.
+    """
+    if not trajectory:
+        return float("nan")
+    if len(trajectory) >= _SMOOTH_WINDOW:
+        window = trajectory[-_SMOOTH_WINDOW:]
+    else:
+        window = trajectory
+    clean = [x for x in window if x >= 0.0 and x == x and x != float("inf")]
+    if not clean:
+        return float("nan")
+    return sum(clean) / len(clean)
+
+
 def _liger_telemetry(opt: torch.optim.Optimizer) -> dict:
     """Return Liger telemetry if available, else zero-filled defaults."""
     fn = getattr(opt, "get_telemetry", None)
@@ -111,6 +134,19 @@ def _liger_telemetry(opt: torch.optim.Optimizer) -> dict:
     }
 
 
+# Real-task problems run to a fixed budget (no early-stop) so different
+# optimizers see the same step count. The original early-stop behavior
+# (break at first ``converged()``) produced a methodologically unfair
+# comparison because slower-but-better-final optimizers were stopped at
+# different steps than faster-but-noisier ones. The flag below is also
+# user-exposable via ``--fixed-budget`` on the CLI for any problem.
+_FIXED_BUDGET_PROBLEMS = frozenset({
+    "r1_cifar10_resnet18",
+    "r2_charlm_shakespeare",
+    "r3_nanogpt_wikitext2",
+})
+
+
 def run_one(
     problem_name: str,
     optimizer_name: str,
@@ -118,8 +154,14 @@ def run_one(
     seed: int,
     max_steps: Optional[int] = None,
     device: str = "cpu",
+    fixed_budget: bool = False,
 ) -> dict:
     """Run one (problem, optimizer, lr, seed) configuration.
+
+    Args:
+        fixed_budget: if True, suppress early-stop on ``problem.converged()``
+            and run the full ``max_steps``. Auto-enabled for R1/R2/R3
+            problems regardless of the caller's setting.
 
     Returns a dict matching the CSV row schema.
     """
@@ -129,6 +171,13 @@ def run_one(
     problem = _build_problem(problem_name, seed, device=device)
     params = problem.init_params()
     opt = build_optimizer(optimizer_name, params, lr)
+
+    # Auto-enable fixed-budget for R1/R2/R3. Early-stop on these is unfair:
+    # different optimizers stop at different steps, so the comparison is not
+    # apples-to-apples. Synthetic problems P1-P5 still honour the
+    # caller-provided ``fixed_budget`` (default False, i.e. early-stop on).
+    if problem_name in _FIXED_BUDGET_PROBLEMS:
+        fixed_budget = True
 
     cap = max_steps if max_steps is not None else problem.max_steps
 
@@ -164,7 +213,11 @@ def run_one(
             # For most problems we stop here; for P3 and P4 the converged
             # criterion is never reached intentionally (we want the full
             # trajectory) — those are handled by their own ``converged``.
-            if problem.converged(loss, step):
+            # When ``fixed_budget`` is set (auto-on for R1/R2/R3), we
+            # *record* the first-convergence step but do not break: the
+            # comparison must run all optimizers to the same step count
+            # so per-optimizer final-loss numbers are directly comparable.
+            if not fixed_budget and problem.converged(loss, step):
                 break
 
     if use_cuda:
@@ -177,6 +230,15 @@ def run_one(
     tel = _liger_telemetry(opt)
     state_bytes = measure_optimizer_state_bytes(opt)
 
+    # Reporting convention: final_loss is the mean of the last 50 steps
+    # when the trajectory is long enough. A single trailing noisy minibatch
+    # loss is not a fair estimator of final-loss for stochastic training;
+    # the smoothed window gives a stable point estimate that does not
+    # privilege optimizers whose last batch happened to be easy. Falls
+    # through to last-step for short trajectories (e.g. early-converged
+    # synthetic problems with fewer than 50 steps).
+    final_loss = _smoothed_final_loss(trajectory)
+
     return {
         "problem": problem_name,
         "optimizer": optimizer_name,
@@ -184,7 +246,7 @@ def run_one(
         "seed": seed,
         "steps": steps_run,
         "convergence_step": convergence_step,
-        "final_loss": trajectory[-1] if trajectory else float("nan"),
+        "final_loss": final_loss,
         "wall_clock_per_step_us": round(per_step_us, 2),
         "nan_count": nan_count,
         "num_2d_params": tel["num_2d_params"],
@@ -263,6 +325,7 @@ def run_sweep(
     seeds: Tuple[int, ...] = _DEFAULT_SWEEP_SEEDS,
     device: str = "cpu",
     skip_existing: bool = False,
+    fixed_budget: bool = False,
 ) -> None:
     """Run the full sweep matrix and write rows to CSV.
 
@@ -294,7 +357,11 @@ def run_sweep(
                         flush=True,
                     )
                     try:
-                        row = run_one(problem, opt, lr, seed, device=device)
+                        row = run_one(
+                            problem, opt, lr, seed,
+                            device=device,
+                            fixed_budget=fixed_budget,
+                        )
                     except NotImplementedError as exc:
                         print(f"  SKIP: {exc}")
                         continue
@@ -322,6 +389,14 @@ def main() -> None:
         default="cpu",
         help="device for tensors (default: cpu)",
     )
+    ap.add_argument(
+        "--fixed-budget",
+        action="store_true",
+        help=(
+            "suppress early-stop on problem.converged() and run to "
+            "max_steps. Auto-on for R1/R2/R3 regardless."
+        ),
+    )
     args = ap.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -330,7 +405,11 @@ def main() -> None:
     if args.sweep:
         if args.output is None:
             args.output = Path("results.csv")
-        run_sweep(args.output, device=args.device)
+        run_sweep(
+            args.output,
+            device=args.device,
+            fixed_budget=args.fixed_budget,
+        )
         return
 
     if not (args.problem and args.optimizer and args.lr):
@@ -343,6 +422,7 @@ def main() -> None:
         args.seed,
         args.max_steps,
         device=args.device,
+        fixed_budget=args.fixed_budget,
     )
     _write_row(args.output, row, append=False)
 
